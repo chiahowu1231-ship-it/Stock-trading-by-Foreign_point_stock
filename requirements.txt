@@ -1,0 +1,6 @@
+pandas
+requests
+beautifulsoup4
+yfinance
+openpyxl
+reportlab
