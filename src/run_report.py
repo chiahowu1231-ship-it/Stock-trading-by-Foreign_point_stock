@@ -813,32 +813,125 @@ def export_pdf(df: pd.DataFrame, pdf_path: str, summary: dict):
     )
     elements = [title_para, Spacer(1, 6), meta_para, Spacer(1, 10)]
 
-    # ── 核心欄位（PDF 顯示精簡版，省略 5日均量/今日高/今日量）────────────────
-    PDF_COLS = [
-        "代碼", "名稱", "大戶", "淨超", "區間均價", "現價", "乖離率",
-        "20日高", "10日均",
-        "進場價", "停損價", "停利1", "停利2",
-        "每張風險NT$", "風報比",
-        "突破20日高", "放量1.5倍", "流動性足夠", "站上10均", "大盤站月線", "綜合判斷",
+    # ── PDF 欄位設計原則 ──────────────────────────────────────────────────────
+    # Landscape A4 可用寬度 = 841.89 - 12×2 = 817.89 pt
+    # 欄寬總計必須 ≤ 817，否則右側會被截斷。
+    # 長文字欄（名稱/大戶/訊號）用 Paragraph 自動折行，避免橫向溢出。
+    # 布林訊號欄（突破/放量/流動性/月線）合併為單一「條件」欄顯示圖示，節省空間。
+    # ─────────────────────────────────────────────────────────────────────────
+    from reportlab.platypus import Paragraph as RP
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+    fn = normal.fontName
+    fs = 7  # 基本字體大小
+
+    sty_c  = ParagraphStyle("c",  fontName=fn, fontSize=fs, alignment=TA_CENTER, leading=9)
+    sty_l  = ParagraphStyle("l",  fontName=fn, fontSize=fs, alignment=TA_LEFT,   leading=9)
+    sty_r  = ParagraphStyle("r",  fontName=fn, fontSize=fs, alignment=TA_RIGHT,  leading=9)
+    sty_hd = ParagraphStyle("hd", fontName=fn, fontSize=6.5, alignment=TA_CENTER,
+                             leading=8, textColor=colors.HexColor("#333333"))
+
+    # ── 欄位定義：(欄名, 寬pt, 對齊樣式, 是否折行) ─────────────────────────
+    # 欄寬總和 = 35+65+80+42+40+40+40+44+44+44+44+44+36+52+48 = 698pt  ← 留 120pt 餘裕
+    COL_DEFS = [
+        ("代碼",      35, sty_c, False),
+        ("名稱",      65, sty_l, True),   # 折行
+        ("大戶",      80, sty_l, True),   # 折行：外資名稱較長
+        ("淨超",      42, sty_r, False),
+        ("均價",      40, sty_r, False),  # 區間均價縮短顯示
+        ("現價",      40, sty_r, False),
+        ("乖離率",    40, sty_r, False),
+        ("進場價",    44, sty_r, False),
+        ("停損價",    44, sty_r, False),
+        ("停利1",     44, sty_r, False),
+        ("停利2",     44, sty_r, False),
+        ("每張風險",  44, sty_r, False),  # 每張風險NT$縮短
+        ("風報比",    36, sty_c, False),
+        ("訊號",      52, sty_c, True),   # 綜合判斷
+        ("4條件",     48, sty_c, True),   # 突破+放量+流動+月線合併
     ]
 
-    if df is not None and not df.empty:
-        pdf_df  = df[PDF_COLS]
-        header  = PDF_COLS
-        data    = [header] + pdf_df.astype(str).values.tolist()
-    else:
-        data = [PDF_COLS]
+    # 原始欄名映射
+    SRC_MAP = {
+        "代碼":   "代碼",
+        "名稱":   "名稱",
+        "大戶":   "大戶",
+        "淨超":   "淨超",
+        "均價":   "區間均價",
+        "現價":   "現價",
+        "乖離率": "乖離率",
+        "進場價": "進場價",
+        "停損價": "停損價",
+        "停利1":  "停利1",
+        "停利2":  "停利2",
+        "每張風險": "每張風險NT$",
+        "風報比": "風報比",
+        "訊號":   "綜合判斷",   # 直接取綜合判斷
+        "4條件":  "_cond",       # 組合欄，特殊處理
+    }
 
-    tbl = Table(data, repeatRows=1)
+    col_names  = [d[0] for d in COL_DEFS]
+    col_widths = [d[1] for d in COL_DEFS]
+    col_stys   = [d[2] for d in COL_DEFS]
+    col_wrap   = [d[3] for d in COL_DEFS]
+
+    def _cell(val, sty, wrap):
+        s = str(val) if val is not None else ""
+        return RP(s, sty) if wrap else s
+
+    # ── 表頭 ─────────────────────────────────────────────────────────────────
+    header_row = [RP(n, sty_hd) for n in col_names]
+
+    # ── 資料列 ───────────────────────────────────────────────────────────────
+    data_rows = []
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            r = []
+            for (cn, _w, sty, wrap), src in zip(COL_DEFS, [SRC_MAP[c] for c in col_names]):
+                if src == "_cond":
+                    # 四條件圖示合併：突破/放量/流動/月線
+                    v = (str(row.get("突破20日高","")) +
+                         str(row.get("放量1.5倍","")) +
+                         str(row.get("流動性足夠","")) +
+                         str(row.get("大盤站月線","")))
+                    r.append(RP(v, sty_c))
+                else:
+                    val = row.get(src, "")
+                    r.append(_cell(val, sty, wrap))
+            data_rows.append(r)
+
+    data = [header_row] + data_rows if data_rows else [header_row]
+
+    tbl = Table(data, repeatRows=1, colWidths=col_widths)
     tbl.setStyle(TableStyle([
-        ("FONTNAME",    (0, 0), (-1, -1), normal.fontName),
-        ("FONTSIZE",    (0, 0), (-1, -1), 7),
-        ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#EAEAEA")),
-        ("GRID",        (0, 0), (-1, -1), 0.25, colors.grey),
+        ("FONTNAME",    (0, 0), (-1, -1), fn),
+        ("FONTSIZE",    (0, 0), (-1, -1), fs),
+        ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#D5E8F0")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.HexColor("#1A2A3A")),
+        ("FONTSIZE",    (0, 0), (-1, 0),  6.5),
+        ("GRID",        (0, 0), (-1, -1), 0.2, colors.HexColor("#BBBBBB")),
         ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
         ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F7F7")]),
+        ("TOPPADDING",  (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING",(0,0), (-1, -1), 2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING",(0, 0), (-1, -1), 2),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F9FC")]),
     ]))
+    # 🔥可買 列補色（TableStyle 不支援動態 list comprehension，改用 addCommand）
+    verdict_col_idx = col_names.index("訊號") if "訊號" in col_names else -1
+    if verdict_col_idx >= 0:
+        for i, row_data in enumerate(data_rows):
+            cell = row_data[verdict_col_idx]
+            if hasattr(cell, "text"):
+                txt = cell.text
+            else:
+                txt = str(cell)
+            if "可買" in txt:
+                tbl.setStyle(TableStyle([
+                    ("BACKGROUND", (0, i+1), (-1, i+1), colors.HexColor("#FFF8DC")),
+                ]))
     elements.append(tbl)
 
     if summary.get("errors"):
