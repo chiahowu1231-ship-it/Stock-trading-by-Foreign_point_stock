@@ -642,6 +642,8 @@ def build_report(days: int):
                         "stop":    r["停損價"],
                         "tp1":     r["停利1"],
                         "tp2":     r["停利2"],
+                        "rr":      r["風報比"],        # mailer / AI prompt 風報比
+                        "risk":    r["每張風險NT$"],   # 每張風險金額（NT$）
                         "verdict": r["綜合判斷"],
                     }
                     for _, r in sub.iterrows()

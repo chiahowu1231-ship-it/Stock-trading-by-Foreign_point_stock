@@ -957,20 +957,27 @@ def build_html(summary: dict) -> str:
             'letter-spacing:1px;">🔥 半量化進場訊號（今日符合進場條件）</span></div>'
         )
         sig_tbl = _table_open([
-            ("auto",""), ("65px",""), ("65px",""), ("65px",""), ("65px",""),
-            ("65px",""), ("55px",""), ("80px",""),
+            ("auto",""), ("60px",""), ("65px",""), ("65px",""), ("65px",""),
+            ("65px",""), ("50px",""), ("75px",""), ("70px",""),
         ])
         sig_tbl += _th_row(
             ("代號　名稱", "left"), ("現價", "right"), ("進場價", "right"),
             ("停損價", "right"), ("停利1", "right"), ("停利2", "right"),
-            ("風報比", "right"), ("外資券商", "center"),
+            ("風報比", "right"), ("每張風險NT$", "right"), ("外資券商", "center"),
             bg="#7D6608",
         )
         for si, r in enumerate(buy_signals):
             bg = "#FFFDE7" if si % 2 == 0 else "#FFF9C4"
-            entry = r.get("entry", "-"); stop = r.get("stop", "-")
-            tp1   = r.get("tp1",   "-"); tp2  = r.get("tp2",  "-")
+            entry = r.get("entry", "-"); stop  = r.get("stop",  "-")
+            tp1   = r.get("tp1",   "-"); tp2   = r.get("tp2",   "-")
             rr    = r.get("rr",    "-"); price = r.get("price", "-")
+            risk  = r.get("risk",  "-")
+            # 每張風險：金額較大顯示橙色警示
+            try:
+                risk_num = int(str(risk).replace(",",""))
+                risk_color = "#C0392B" if risk_num > 50000 else "#E67E22" if risk_num > 20000 else "#27AE60"
+            except Exception:
+                risk_color = "#555"
             sig_tbl += _tr(
                 _td(f'<span style="font-weight:700;color:#1A5276;">{_esc(r.get("sid",""))}</span>'
                     f'&nbsp;<span style="font-weight:600;">{_esc(r.get("name",""))}</span>'),
@@ -980,6 +987,7 @@ def build_html(summary: dict) -> str:
                 _td(f'<span style="color:#1A7A4A;font-weight:700;">{_esc(str(tp1))}</span>',   "right"),
                 _td(f'<span style="color:#6C3483;font-weight:700;">{_esc(str(tp2))}</span>',   "right"),
                 _td(f'<span style="color:#2874A6;font-weight:700;">{_esc(str(rr))}</span>',    "right"),
+                _td(f'<span style="color:{risk_color};font-weight:700;">{_esc(str(risk))}</span>', "right"),
                 _td(f'<span style="font-size:11px;color:#555;">{_esc(r.get("_broker",""))}</span>', "center"),
                 bg=bg,
             )
@@ -988,7 +996,7 @@ def build_html(summary: dict) -> str:
         p.append(
             '<div style="margin:4px 0 16px;padding:6px 12px;background:#FFF9C4;'
             'border-left:4px solid #FFD700;font-size:11.5px;color:#7D4000;">'
-            '⚠️ 進場條件：突破20日高 + 放量1.5倍 + 流動性≥500張 + 站上10均 + 大盤月線 + 外資淨買超'
+            '⚠️ 進場條件：突破20日高 + 放量1.5倍(≥500張) + 站上10均 + 大盤月線 + 外資淨買超（六大條件全過）'
             '&nbsp;｜&nbsp;停損 -8%&nbsp;｜&nbsp;停利1 +20%&nbsp;｜&nbsp;停利2 +35%</div>'
         )
     else:

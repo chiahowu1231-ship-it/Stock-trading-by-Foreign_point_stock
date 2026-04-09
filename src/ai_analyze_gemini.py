@@ -151,8 +151,9 @@ def build_prompt(summary: dict) -> str:
             stop    = r.get("stop",   "")
             tp1     = r.get("tp1",    "")
             rr      = r.get("rr",     "")
+            risk  = r.get("risk",  "")
             signal_part = (
-                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1} 風報比:{rr}"
+                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1} 風報比:{rr} 每張風險:{risk}元"
                 if "可買" in str(verdict) else "｜【觀察】"
             )
             lines.append(
