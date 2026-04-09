@@ -60,7 +60,7 @@ ENABLE_FIXUP = os.getenv("GEMINI_ENABLE_FIXUP", "1").strip() != "0"
 PROMPT_TOP_BROKERS = int(os.getenv("PROMPT_TOP_BROKERS", "7"))  # 送幾家外資
 PROMPT_TOP_STOCKS = int(os.getenv("PROMPT_TOP_STOCKS", "7"))    # 每家送幾檔
 
-ANALYZER_VERSION = "v11-pro-expert-deep"
+ANALYZER_VERSION = "v12-semi-quant-signal"
 
 
 # ── 檔案讀寫 ──────────────────────────────────────
@@ -145,8 +145,20 @@ def build_prompt(summary: dict) -> str:
     for block in brokers_to_send:
         lines.append(f"- {block.get('broker','')}｜總淨超 {block.get('total_net',0)} 張")
         for r in (block.get("rows") or [])[:PROMPT_TOP_STOCKS]:
+            # 半量化訊號欄位（新版 run_report 已產出）
+            verdict = r.get("verdict", "觀察")
+            entry   = r.get("entry",  "")
+            stop    = r.get("stop",   "")
+            tp1     = r.get("tp1",    "")
+            rr      = r.get("rr",     "")
+            signal_part = (
+                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1} 風報比:{rr}"
+                if "可買" in str(verdict) else "｜【觀察】"
+            )
             lines.append(
-                f"  * {r.get('sid','')} {r.get('name','')}｜淨超 {r.get('net',0)}｜均價 {r.get('avg','')}｜現價 {r.get('price','')}｜乖離 {r.get('bias','')}"
+                f"  * {r.get('sid','')} {r.get('name','')}｜淨超 {r.get('net',0)}"
+                f"｜均價 {r.get('avg','')}｜現價 {r.get('price','')}｜乖離 {r.get('bias','')}"
+                f"{signal_part}"
             )
     lines.append("")
 
@@ -159,8 +171,15 @@ def build_prompt(summary: dict) -> str:
         lines.append("")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #  輸出結構指令（專業版）
+    #  輸出結構指令（半量化訊號版）
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    lines.append("【系統背景】")
+    lines.append("本系統為「半量化交易訊號系統」。每筆資料除外資籌碼外，已自動計算：")
+    lines.append("  進場價 = MAX(收盤,20日高) × 1.01｜停損 = 進場×0.92（-8%）")
+    lines.append("  停利1 = 進場×1.20｜停利2 = 進場×1.35｜移動停損 = 10日均線")
+    lines.append("  進場條件：突破20日高 + 放量1.5倍(≥500張) + 站上10均 + 大盤月線 + 外資淨買超")
+    lines.append("  標記【🔥可買】= 六大條件全部通過；【觀察】= 尚未觸發")
+    lines.append("")
     lines.append("請依照以下結構輸出完整報告（每區塊中間空一行）：")
     lines.append("")
 
@@ -185,15 +204,15 @@ def build_prompt(summary: dict) -> str:
     lines.append("   - 多空定性：該外資整體偏多/偏空/中性，附帶簡短理由")
     lines.append("")
 
-    # C) 觀察清單
-    lines.append("C) 明日觀察清單（5 檔，每檔 5 行）：")
-    lines.append("   選股邏輯：優先選『多家外資共同買超 + 正乖離 + 淨超張數大』的標的。")
-    lines.append("   每檔必須包含：")
-    lines.append("   1) 選入理由：哪幾家外資買超？總淨超多少？乖離率與均價相對位置")
-    lines.append("   2) 進場條件：基於均價/乖離率/淨超集中度，給出明確的進場觸發條件")
-    lines.append("   3) 停損邏輯：跌破均價多少%？或乖離率轉負？或外資淨超反轉的量化標準")
-    lines.append("   4) 了結邏輯：乖離率擴大至多少%以上？或外資連續N日減碼？具體數字")
-    lines.append("   5) 部位建議：建議倉位比例（如『試單1成/標準3成/重倉不超過5成』），及分批進場節奏")
+    # C) 觀察清單（半量化訊號版）
+    lines.append("C) 明日操作清單（5 檔，每檔 5 行）：")
+    lines.append("   選股邏輯（優先順序）：①【🔥可買】六大條件全過的個股 → ②多家外資共同買超 → ③淨超張數大且正乖離。")
+    lines.append("   若【🔥可買】個股不足5檔，以籌碼面補足。每檔必須包含以下五行：")
+    lines.append("   1) 選入理由：訊號類型（🔥可買/籌碼觀察）+ 哪幾家外資買超 + 總淨超張數 + 乖離率位置")
+    lines.append("   2) 進場策略：直接引用系統計算的進場價（若為🔥可買標的）；或自行根據籌碼推估觸發條件")
+    lines.append("   3) 停損策略：直接引用系統停損價（進場×0.92，即-8%）；說明停損邏輯（收盤跌破/盤中跌破）")
+    lines.append("   4) 停利策略：停利1（+20%）和停利2（+35%）的分批了結節奏；並說明10均移動停損啟動時機")
+    lines.append("   5) 部位與風險：每張風險NT$=（進場-停損）×1000，建議倉位比例（1成試單/3成標準/5成重倉上限）")
     lines.append("   - 若有千張大戶資料，請分析大戶籌碼集中度對股價支撐/壓力的影響。")
     lines.append("")
 
@@ -209,7 +228,7 @@ def build_prompt(summary: dict) -> str:
     lines.append("")
 
     # E) 摘要
-    lines.append("E) 一句話摘要（≤30字，專業精準）。")
+    lines.append("E) 一句話摘要（≤30字，須含今日🔥可買訊號數量及大盤方向判斷）。")
     lines.append("")
 
     # F) 交叉比對

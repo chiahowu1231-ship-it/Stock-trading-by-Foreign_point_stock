@@ -542,10 +542,16 @@ def _render_broker_block(block: dict, rank: int) -> str:
     if not rows:
         return header + '<div style="padding:8px 14px;background:#F8F9FA;border:1px solid #D5D8DC;border-top:none;border-radius:0 0 5px 5px;font-size:12px;color:#888;">本期無明細資料</div>'
 
-    tbl = _table_open([("30px",""), ("auto",""), ("80px",""), ("70px",""), ("70px",""), ("70px","")])
+    # 欄寬：# / 代號名稱 / 淨超 / 均價 / 現價 / 乖離率 / 進場價 / 停損 / 停利1 / 風報比 / 訊號
+    tbl = _table_open([
+        ("25px",""), ("auto",""), ("70px",""), ("65px",""), ("65px",""), ("60px",""),
+        ("65px",""), ("65px",""), ("65px",""), ("55px",""), ("60px",""),
+    ])
     tbl += _th_row(
         ("#", "center"), ("代號　股票名稱", "left"), ("淨超(張)", "right"),
-        ("區間均價", "right"), ("現　　價", "right"), ("乖離率", "right"),
+        ("均價", "right"), ("現價", "right"), ("乖離率", "right"),
+        ("進場價", "right"), ("停損價", "right"), ("停利1", "right"),
+        ("風報比", "right"), ("訊號", "center"),
         bg="#1A252F",
     )
     for j, r in enumerate(rows[:5], 1):
@@ -554,24 +560,34 @@ def _render_broker_block(block: dict, rank: int) -> str:
         bias_raw = str(r.get("bias", "")).replace("%", "").strip()
         try:
             bv   = float(bias_raw)
-            # 乖離率色階：>5% 深紅、1~5% 淺紅、-1~1% 灰、-1~-5% 淺綠、<-5% 深綠
-            if bv > 5:
-                bias_c, bias_bg = "#922B21", "#FADBD8"
-            elif bv > 1:
-                bias_c, bias_bg = "#C0392B", "#FDF2F2"
-            elif bv < -5:
-                bias_c, bias_bg = "#1A5632", "#D5F5E3"
-            elif bv < -1:
-                bias_c, bias_bg = "#27AE60", "#EAFAF1"
-            else:
-                bias_c, bias_bg = "#555", "#F8F9FA"
+            if bv > 5:   bias_c, bias_bg = "#922B21", "#FADBD8"
+            elif bv > 1: bias_c, bias_bg = "#C0392B", "#FDF2F2"
+            elif bv < -5:bias_c, bias_bg = "#1A5632", "#D5F5E3"
+            elif bv < -1:bias_c, bias_bg = "#27AE60", "#EAFAF1"
+            else:         bias_c, bias_bg = "#555",    "#F8F9FA"
             bias_html = (
-                f'<span style="display:inline-block;padding:1px 6px;'
+                f'<span style="display:inline-block;padding:1px 5px;'
                 f'background:{bias_bg};color:{bias_c};border-radius:3px;'
-                f'font-size:11.5px;font-weight:700;">{r.get("bias","")}</span>'
+                f'font-size:11px;font-weight:700;">{r.get("bias","")}</span>'
             )
         except Exception:
             bias_html = _esc(str(r.get("bias", "")))
+
+        # 訊號欄：🔥可買 → 金黃亮燈；其他 → 灰色觀察
+        verdict = str(r.get("verdict", "觀察"))
+        if "可買" in verdict:
+            sig_html = '<span style="display:inline-block;padding:1px 6px;background:#FFD700;color:#7D4000;border-radius:3px;font-size:11px;font-weight:800;">🔥可買</span>'
+        else:
+            sig_html = '<span style="color:#AAA;font-size:11px;">觀察</span>'
+
+        # 風報比
+        rr = r.get("rr", "")
+        rr_html = f'<span style="color:#2874A6;font-size:11px;font-weight:700;">{_esc(str(rr))}</span>' if rr else "-"
+
+        # 進場/停損/停利（取自 top_preview rows）
+        entry = r.get("entry", "")
+        stop  = r.get("stop",  "")
+        tp1   = r.get("tp1",   "")
 
         bg = "#FDFEFE" if j % 2 else "#F2F3F4"
         tbl += _tr(
@@ -582,6 +598,11 @@ def _render_broker_block(block: dict, rank: int) -> str:
             _td(f'<span style="color:#7F8C8D;">{_esc(str(r.get("avg","")))}</span>', "right"),
             _td(f'<span style="font-weight:700;color:#333;">{_esc(str(r.get("price","")))}</span>', "right"),
             _td(bias_html, "right"),
+            _td(f'<span style="color:#1A5276;font-weight:700;">{_esc(str(entry))}</span>', "right") if entry else _td("-", "right"),
+            _td(f'<span style="color:#C0392B;font-weight:700;">{_esc(str(stop))}</span>', "right")  if stop  else _td("-", "right"),
+            _td(f'<span style="color:#1A7A4A;font-weight:700;">{_esc(str(tp1))}</span>', "right")   if tp1   else _td("-", "right"),
+            _td(rr_html, "right"),
+            _td(sig_html, "center"),
             bg=bg,
         )
     tbl += TABLE_CLOSE
@@ -819,18 +840,30 @@ def build_html(summary: dict) -> str:
     brk_ok   = summary.get("brokers_ok", 0)
     brk_fail = summary.get("brokers_fail", 0)
 
+    # 大盤月線狀態（從 summary 取）
+    taiex_ma = summary.get("taiex_above_ma20")
+    taiex_ma_badge = (
+        '<span style="color:#58D68D;font-weight:700;">✅ 大盤站月線</span>'
+        if taiex_ma else
+        '<span style="color:#EC7063;font-weight:700;">❌ 大盤跌月線</span>'
+        if taiex_ma is not None else ""
+    )
+
     p.append(
         f'<div style="background:#0F2744;border-bottom:3px solid #1F6FAB;'
         f'padding:22px 26px 18px;border-radius:8px 8px 0 0;">'
-        f'<h1 style="margin:0 0 6px;font-size:22px;color:#fff;font-weight:800;'
-        f'letter-spacing:.5px;">📈 外資分點狙擊分析</h1>'
+        f'<h1 style="margin:0 0 4px;font-size:22px;color:#fff;font-weight:800;'
+        f'letter-spacing:.5px;">📊 半量化交易訊號系統</h1>'
+        f'<p style="margin:0 0 6px;font-size:12px;color:#7FB3D3;line-height:1.6;">'
+        f'外資籌碼 × 技術突破 × 流動性 × 風報比 × 大盤月線&nbsp;→&nbsp;自動產出次日進場訊號</p>'
         f'<p style="margin:0;font-size:12.5px;color:#B0C8E8;line-height:1.8;">'
         f'產生時間：{_esc(gen_at)}&nbsp;｜&nbsp;近 {days} 日&nbsp;｜&nbsp;'
         f'資料筆數：{tot_rows:,}&nbsp;｜&nbsp;'
         f'<span style="color:{sc};font-weight:700;">{st}</span>&nbsp;｜&nbsp;'
         f'OK <span style="color:#58D68D;">{brk_ok}</span> / '
         f'FAIL <span style="color:#EC7063;">{brk_fail}</span>'
-        f'</p></div>'
+        + (f'&nbsp;｜&nbsp;{taiex_ma_badge}' if taiex_ma_badge else '')
+        + f'</p></div>'
     )
 
     # ── GitHub Actions 連結 ───────────────────────────
@@ -906,6 +939,66 @@ def build_html(summary: dict) -> str:
         p.append(_render_tdcc(tdcc))
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  二點五、🔥 半量化進場訊號（🔥可買 個股）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 從 top_preview 撈出所有 verdict=="🔥可買" 的個股
+    buy_signals = []
+    for block in top_preview:
+        broker_name = block.get("broker", "")
+        for r in (block.get("rows") or []):
+            if "可買" in str(r.get("verdict", "")):
+                buy_signals.append({**r, "_broker": broker_name})
+
+    if buy_signals:
+        p.append(
+            '<div style="margin:20px 0 4px;padding:6px 14px;'
+            'background:#7D6608;border-radius:4px;">'
+            '<span style="font-size:13px;font-weight:700;color:#FFD700;'
+            'letter-spacing:1px;">🔥 半量化進場訊號（今日符合進場條件）</span></div>'
+        )
+        sig_tbl = _table_open([
+            ("auto",""), ("65px",""), ("65px",""), ("65px",""), ("65px",""),
+            ("65px",""), ("55px",""), ("80px",""),
+        ])
+        sig_tbl += _th_row(
+            ("代號　名稱", "left"), ("現價", "right"), ("進場價", "right"),
+            ("停損價", "right"), ("停利1", "right"), ("停利2", "right"),
+            ("風報比", "right"), ("外資券商", "center"),
+            bg="#7D6608",
+        )
+        for si, r in enumerate(buy_signals):
+            bg = "#FFFDE7" if si % 2 == 0 else "#FFF9C4"
+            entry = r.get("entry", "-"); stop = r.get("stop", "-")
+            tp1   = r.get("tp1",   "-"); tp2  = r.get("tp2",  "-")
+            rr    = r.get("rr",    "-"); price = r.get("price", "-")
+            sig_tbl += _tr(
+                _td(f'<span style="font-weight:700;color:#1A5276;">{_esc(r.get("sid",""))}</span>'
+                    f'&nbsp;<span style="font-weight:600;">{_esc(r.get("name",""))}</span>'),
+                _td(f'<b>{_esc(str(price))}</b>', "right"),
+                _td(f'<span style="color:#1A5276;font-weight:700;">{_esc(str(entry))}</span>', "right"),
+                _td(f'<span style="color:#C0392B;font-weight:700;">{_esc(str(stop))}</span>',  "right"),
+                _td(f'<span style="color:#1A7A4A;font-weight:700;">{_esc(str(tp1))}</span>',   "right"),
+                _td(f'<span style="color:#6C3483;font-weight:700;">{_esc(str(tp2))}</span>',   "right"),
+                _td(f'<span style="color:#2874A6;font-weight:700;">{_esc(str(rr))}</span>',    "right"),
+                _td(f'<span style="font-size:11px;color:#555;">{_esc(r.get("_broker",""))}</span>', "center"),
+                bg=bg,
+            )
+        sig_tbl += TABLE_CLOSE
+        p.append(sig_tbl)
+        p.append(
+            '<div style="margin:4px 0 16px;padding:6px 12px;background:#FFF9C4;'
+            'border-left:4px solid #FFD700;font-size:11.5px;color:#7D4000;">'
+            '⚠️ 進場條件：突破20日高 + 放量1.5倍 + 流動性≥500張 + 站上10均 + 大盤月線 + 外資淨買超'
+            '&nbsp;｜&nbsp;停損 -8%&nbsp;｜&nbsp;停利1 +20%&nbsp;｜&nbsp;停利2 +35%</div>'
+        )
+    else:
+        p.append(
+            '<div style="margin:16px 0;padding:8px 14px;background:#F4F4F4;'
+            'border-radius:4px;font-size:12px;color:#888;">'
+            '今日無符合半量化六大進場條件的個股。</div>'
+        )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  四、AI 深度分析
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     ai_text     = summary.get("ai_analysis", "")
@@ -976,7 +1069,7 @@ def build_html(summary: dict) -> str:
     p.append(
         f'<div style="padding:10px 22px;background:#1A2A3A;'
         f'border-radius:0 0 8px 8px;font-size:11px;color:#9DB5CC;text-align:center;">'
-        f'此信由 GitHub Actions 自動寄出 ｜ {ymd_now} (TW) ｜ 外資分點狙擊分析系統</div>'
+        f'此信由 GitHub Actions 自動寄出 ｜ {ymd_now} (TW) ｜ 半量化交易訊號系統</div>'
     )
 
     body = "\n".join(p)
