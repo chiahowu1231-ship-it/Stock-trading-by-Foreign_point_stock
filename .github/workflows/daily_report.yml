@@ -108,7 +108,7 @@ jobs:
         run: |
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           REPORT_DATE="$(TZ=Asia/Taipei date +'%Y-%m-%d')"
-          echo "MAIL_SUBJECT=【外資分點狙擊分析】${REPORT_DATE}（TW 18:00）${REPO_NAME}" >> $GITHUB_ENV
+          echo "MAIL_SUBJECT=【外資半量化交易訊號系統分析】${REPORT_DATE}（TW 18:00）${REPO_NAME}" >> $GITHUB_ENV
 
       - name: Send email (always)
         if: always()
