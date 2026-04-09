@@ -1,1 +1,125 @@
+name: 外資分點狙擊分析 (TW 18:00)
 
+on:
+  schedule:
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20   # 加入大盤資料抓取，預留更多時間
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      TZ: Asia/Taipei
+      DAYS: "5"
+      TOP_N: "10"
+      DEBUG_HTML: "1"
+
+      # ✅ 大盤籌碼抓取（1=啟用, 0=停用）
+      MARKET_DATA: "1"
+      MARKET_HISTORY_DAYS: "6"   # 抓取天數（含當天+前5天）
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # run_report 現在會同時抓大盤籌碼（三大法人、量能、融資融券、期貨、千張大戶）
+      - name: Generate Excel/PDF + market data (DAYS=5)
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python src/run_report.py
+
+      # v9 AI 分析：prompt 內含大盤籌碼 context
+      - name: Gemini analysis (v9 + market context)
+        if: always()
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-2.5-pro"
+          GEMINI_TEMPERATURE: "0.3"
+          PROMPT_TOP_BROKERS: "7"
+          PROMPT_TOP_STOCKS: "7"
+          GEMINI_RETRIES: "3"
+          GEMINI_RETRY_BASE_SLEEP: "2.0"
+          GEMINI_ENABLE_FIXUP: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python src/ai_analyze_gemini.py
+
+      - name: Verify Gemini analysis (safe)
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          with open("output/summary.json", "r", encoding="utf-8") as f:
+              s = json.load(f)
+          t = s.get("ai_analysis", "") or ""
+          print("ai_model =", s.get("ai_model"))
+          print("ai_analyzer_version =", s.get("ai_analyzer_version"))
+          print("ai_analysis_chars =", len(t))
+          print("ai_analysis_lines =", len(t.splitlines()))
+
+          # 驗證大盤資料是否成功抓取
+          md = s.get("market_data", {})
+          print(f"market_data: inst={len(md.get('institutional',[]))}, "
+                f"taiex={len(md.get('taiex',[]))}, "
+                f"margin={len(md.get('margin',[]))}, "
+                f"futures={len(md.get('futures',[]))}, "
+                f"tdcc={len(md.get('tdcc',[]))}")
+          errs = md.get("fetch_errors", [])
+          if errs:
+              print(f"market fetch_errors: {errs}")
+
+          if "失敗" in t or "error" in t.lower():
+              print("⚠️ AI 分析包含錯誤訊息")
+          else:
+              print("✅ AI 分析正常")
+          PY
+
+      - name: Upload artifacts (auto expire)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: foreign-report
+          path: |
+            output/*.xlsx
+            output/*.pdf
+            output/summary.json
+            output/ai_analysis.txt
+            output/debug/*.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Build mail subject
+        if: always()
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          REPORT_DATE="$(TZ=Asia/Taipei date +'%Y-%m-%d')"
+          echo "MAIL_SUBJECT=【外資分點狙擊分析】${REPORT_DATE}（TW 18:00）${REPO_NAME}" >> $GITHUB_ENV
+
+      - name: Send email (always)
+        if: always()
+        env:
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM:  ${{ secrets.MAIL_FROM }}
+          MAIL_TO:    ${{ secrets.MAIL_TO }}
+          MAIL_BCC:   ${{ secrets.MAIL_BCC }}
+          MAIL_SUBJECT: ${{ env.MAIL_SUBJECT }}
+        run: |
+          python src/mailer.py
