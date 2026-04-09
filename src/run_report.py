@@ -51,22 +51,22 @@ UA = (
 
 NO_DATA_TEXT = "無此券商分點交易資料"
 
-# ── yfinance 共用 Session（連線池）────────────────────────────────────────────
-# ThreadPoolExecutor 開 10 個 worker 並發時，預設每次請求都建立全新 HTTP/SSL 連線，
-# 瞬間大量新連線容易觸發 Yahoo Finance 的 429 限流或直接回傳空值。
-# 用 requests.Session 建立連線池，讓所有 worker 重複利用已建立的底層連線：
-#   ① 大幅降低被鎖 IP 的機率
-#   ② 省去重複 SSL handshake，額外提升 20~30% 爬取速度
-_YF_SESSION = requests.Session()
-_YF_SESSION.headers.update({"User-Agent": UA})
-# 設定連線池大小，上限略大於 TECH_WORKERS 避免等待
-_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=12,
-    pool_maxsize=20,
-    max_retries=0,   # 重試由我們自己的 attempt 迴圈控制，不重複
-)
-_YF_SESSION.mount("https://", _adapter)
-_YF_SESSION.mount("http://",  _adapter)
+# ── yfinance 共用 Session（curl_cffi 連線池）─────────────────────────────────
+# yfinance 1.2.x 起改用 curl_cffi 做 TLS 指紋模擬繞過 Cloudflare 防護。
+# 傳入標準 requests.Session 會直接拋出：
+#   "Yahoo API requires curl_cffi session not requests.sessions.Session"
+# 必須用 curl_cffi.requests.Session 才能同時獲得：
+#   ① 正確的 TLS 指紋（通過 Yahoo 驗證）
+#   ② 連線池重用（降低 429 風險、提升速度）
+try:
+    from curl_cffi.requests import Session as CurlSession
+    _YF_SESSION = CurlSession(impersonate="chrome")
+    _YF_SESSION_OK = True
+except ImportError:
+    # curl_cffi 未安裝時退回 None，yfinance 自行管理 session
+    _YF_SESSION = None
+    _YF_SESSION_OK = False
+    print("[WARN] curl_cffi 未安裝，yfinance 將使用預設 session（pip install curl_cffi 可提速）")
 
 # ── 快取 ──────────────────────────────────────────────────────────────────────
 TECH_DATA_CACHE: dict = {}   # 個股技術面快取
@@ -222,8 +222,10 @@ def get_stock_tech_data(sid: str) -> dict:
                     #   可能只有 13~15 天，導致 tail(20) 實際上只有 15 日高點。
                     #   用 3mo（≈ 60 交易日）可確保任何假期情境下
                     #   tail(20)/tail(10)/tail(5) 都是貨真價實的交易日數量。
-                    # 傳入共用 Session：重複利用連線池，降低 429 風險並提速
-                    hist = yf.Ticker(f"{sid}{suffix}", session=_YF_SESSION).history(period="3mo")
+                    # curl_cffi Session 可用時傳入（連線池 + 正確 TLS 指紋）
+                    # 不可用時讓 yfinance 自行建立 session（功能正常，略慢）
+                    ticker_kwargs = {"session": _YF_SESSION} if _YF_SESSION_OK else {}
+                    hist = yf.Ticker(f"{sid}{suffix}", **ticker_kwargs).history(period="3mo")
 
                 if hist is None or hist.empty:
                     continue
