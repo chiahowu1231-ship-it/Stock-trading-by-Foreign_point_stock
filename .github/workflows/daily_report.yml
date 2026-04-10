@@ -21,6 +21,11 @@ jobs:
       MARKET_DATA: "1"
       MARKET_HISTORY_DAYS: "6"   # 抓取天數（含當天+前5天）
 
+      # ✅ 凱利資金控管（半凱利公式 f*/2 = (W-(1-W)/R)/2）
+      # 設定後 Excel/Email 直接顯示「最大張數」，不需手動換算
+      TOTAL_CAPITAL: "1000000"   # 操作總資金（NT$）。未設定或0 = 只顯示半凱利%
+      WIN_RATE: "0.55"           # 策略勝率（0.55=55%）。勝率提升後調整此值即可
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
