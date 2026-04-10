@@ -957,27 +957,42 @@ def build_html(summary: dict) -> str:
             'letter-spacing:1px;">🔥 半量化進場訊號（今日符合進場條件）</span></div>'
         )
         sig_tbl = _table_open([
-            ("auto",""), ("60px",""), ("65px",""), ("65px",""), ("65px",""),
-            ("65px",""), ("50px",""), ("75px",""), ("70px",""),
+            ("auto",""), ("52px",""), ("60px",""), ("60px",""), ("60px",""),
+            ("60px",""), ("45px",""), ("68px",""), ("48px",""), ("60px",""), ("65px",""),
         ])
         sig_tbl += _th_row(
             ("代號　名稱", "left"), ("現價", "right"), ("進場價", "right"),
             ("停損價", "right"), ("停利1", "right"), ("停利2", "right"),
-            ("風報比", "right"), ("每張風險NT$", "right"), ("外資券商", "center"),
+            ("風報比", "right"), ("每張風險NT$", "right"),
+            ("半凱利%", "right"), ("最大張數", "right"), ("外資券商", "center"),
             bg="#7D6608",
         )
         for si, r in enumerate(buy_signals):
             bg = "#FFFDE7" if si % 2 == 0 else "#FFF9C4"
-            entry = r.get("entry", "-"); stop  = r.get("stop",  "-")
-            tp1   = r.get("tp1",   "-"); tp2   = r.get("tp2",   "-")
-            rr    = r.get("rr",    "-"); price = r.get("price", "-")
-            risk  = r.get("risk",  "-")
-            # 每張風險：金額較大顯示橙色警示
+            entry    = r.get("entry",    "-"); stop     = r.get("stop",    "-")
+            tp1      = r.get("tp1",      "-"); tp2      = r.get("tp2",     "-")
+            rr       = r.get("rr",       "-"); price    = r.get("price",   "-")
+            risk     = r.get("risk",     "-"); hkelly   = r.get("hkelly",  "-")
+            max_lots = r.get("max_lots",  0)
+            # 每張風險色階
             try:
-                risk_num = int(str(risk).replace(",",""))
+                risk_num   = int(str(risk).replace(",",""))
                 risk_color = "#C0392B" if risk_num > 50000 else "#E67E22" if risk_num > 20000 else "#27AE60"
             except Exception:
                 risk_color = "#555"
+            # 半凱利%色階
+            try:
+                hk_num   = float(str(hkelly).replace("%",""))
+                hk_color = "#1A5276" if hk_num >= 15 else "#E67E22" if hk_num < 10 else "#555"
+            except Exception:
+                hk_color = "#555"
+            # 最大張數：0=未設定總資金，顯示提示；>0=可買張數
+            if max_lots and int(str(max_lots)) > 0:
+                ml_num   = int(str(max_lots))
+                ml_color = "#1A7A4A" if ml_num > 10 else "#E67E22"
+                ml_html  = f'<span style="color:{ml_color};font-weight:800;font-size:13px;">{ml_num} 張</span>'
+            else:
+                ml_html  = '<span style="color:#AAA;font-size:10px;">未設定</span>'
             sig_tbl += _tr(
                 _td(f'<span style="font-weight:700;color:#1A5276;">{_esc(r.get("sid",""))}</span>'
                     f'&nbsp;<span style="font-weight:600;">{_esc(r.get("name",""))}</span>'),
@@ -988,16 +1003,26 @@ def build_html(summary: dict) -> str:
                 _td(f'<span style="color:#6C3483;font-weight:700;">{_esc(str(tp2))}</span>',   "right"),
                 _td(f'<span style="color:#2874A6;font-weight:700;">{_esc(str(rr))}</span>',    "right"),
                 _td(f'<span style="color:{risk_color};font-weight:700;">{_esc(str(risk))}</span>', "right"),
+                _td(f'<span style="color:{hk_color};font-weight:700;">{_esc(str(hkelly))}%</span>', "right"),
+                _td(ml_html, "right"),
                 _td(f'<span style="font-size:11px;color:#555;">{_esc(r.get("_broker",""))}</span>', "center"),
                 bg=bg,
             )
         sig_tbl += TABLE_CLOSE
         p.append(sig_tbl)
         p.append(
-            '<div style="margin:4px 0 16px;padding:6px 12px;background:#FFF9C4;'
-            'border-left:4px solid #FFD700;font-size:11.5px;color:#7D4000;">'
-            '⚠️ 進場條件：突破20日高 + 放量1.5倍(≥500張) + 站上10均 + 大盤月線 + 外資淨買超（六大條件全過）'
+            '<div style="margin:4px 0 4px;padding:6px 12px;background:#FFF9C4;'
+            'border-left:4px solid #FFD700;font-size:11px;color:#7D4000;line-height:1.7;">'
+            '⚠️ 六大進場條件：突破20日高＋放量1.5倍(≥500張)＋站上10均＋大盤月線＋外資淨買超'
             '&nbsp;｜&nbsp;停損 -8%&nbsp;｜&nbsp;停利1 +20%&nbsp;｜&nbsp;停利2 +35%</div>'
+        )
+        p.append(
+            '<div style="margin:0 0 16px;padding:5px 12px;background:#EBF5FB;'
+            'border-left:4px solid #2E86C1;font-size:11px;color:#1A5276;line-height:1.7;">'
+            '📐 <b>半凱利資金控管</b>：f*/2 = (W−(1−W)÷R)÷2&nbsp;｜&nbsp;'
+            '勝率W=55%、風報比R=2.5 → 半凱利 18.5%&nbsp;｜&nbsp;'
+            '<b>最大張數 = 總資金 × 半凱利% ÷ 每張風險NT$</b>&nbsp;｜&nbsp;'
+            '在 daily_report.yml 的 env 加入 TOTAL_CAPITAL 與 WIN_RATE 即可自動計算張數</div>'
         )
     else:
         p.append(

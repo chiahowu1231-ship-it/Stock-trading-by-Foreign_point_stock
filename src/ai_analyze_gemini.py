@@ -152,8 +152,12 @@ def build_prompt(summary: dict) -> str:
             tp1     = r.get("tp1",    "")
             rr      = r.get("rr",     "")
             risk  = r.get("risk",  "")
+            hkelly   = r.get("hkelly",   "")
+            max_lots = r.get("max_lots", 0)
+            lot_str  = f" 最大張數:{max_lots}張" if max_lots and int(str(max_lots)) > 0 else ""
             signal_part = (
-                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1} 風報比:{rr} 每張風險:{risk}元"
+                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1}"
+                f" 風報比:{rr} 每張風險:{risk}元 半凱利:{hkelly}%{lot_str}"
                 if "可買" in str(verdict) else "｜【觀察】"
             )
             lines.append(
@@ -180,6 +184,8 @@ def build_prompt(summary: dict) -> str:
     lines.append("  停利1 = 進場×1.20｜停利2 = 進場×1.35｜移動停損 = 10日均線")
     lines.append("  進場條件：突破20日高 + 放量1.5倍(≥500張) + 站上10均 + 大盤月線 + 外資淨買超")
     lines.append("  標記【🔥可買】= 六大條件全部通過；【觀察】= 尚未觸發")
+    lines.append("  資金控管（半凱利公式）：半凱利% = (W−(1−W)/R)/2，W=勝率，R=風報比")
+    lines.append("    最大張數（已計算）= 總資金 × 半凱利% / 每張風險NT$（未設定TOTAL_CAPITAL時顯示0）")
     lines.append("")
     lines.append("請依照以下結構輸出完整報告（每區塊中間空一行）：")
     lines.append("")
@@ -213,7 +219,9 @@ def build_prompt(summary: dict) -> str:
     lines.append("   2) 進場策略：直接引用系統計算的進場價（若為🔥可買標的）；或自行根據籌碼推估觸發條件")
     lines.append("   3) 停損策略：直接引用系統停損價（進場×0.92，即-8%）；說明停損邏輯（收盤跌破/盤中跌破）")
     lines.append("   4) 停利策略：停利1（+20%）和停利2（+35%）的分批了結節奏；並說明10均移動停損啟動時機")
-    lines.append("   5) 部位與風險：每張風險NT$=（進場-停損）×1000，建議倉位比例（1成試單/3成標準/5成重倉上限）")
+    lines.append("   5) 部位與風險：直接引用每張風險NT$、半凱利%、最大張數：")
+    lines.append("      格式：每張風險NT$X，半凱利X%，依半凱利最多買X張（信心度高可買X×1.5，低則X×0.5）")
+    lines.append("      最大張數為0時（未設定TOTAL_CAPITAL），請依半凱利%自行換算")
     lines.append("   - 若有千張大戶資料，請分析大戶籌碼集中度對股價支撐/壓力的影響。")
     lines.append("")
 
@@ -221,7 +229,8 @@ def build_prompt(summary: dict) -> str:
     lines.append("D) 風控與資金配置（5~7 點）：")
     lines.append("   不是泛泛的『注意風險』，而是基於數據的具體建議：")
     lines.append("   - 整體持股水位建議（如『建議總持股不超過6成』）及理由")
-    lines.append("   - 單一標的最大部位上限")
+    lines.append("   - 半凱利資金控管（必填）：針對🔥可買各標的，以最大張數為基準給出部位建議")
+    lines.append("     格式：『XXXX 每張風險NT$X / 半凱利X% / 最多X張 / 建議買Y張（信心係數Z×）』")
     lines.append("   - 根據外資期貨空單水位，判斷系統性風險程度（低/中/高）")
     lines.append("   - 融資水位對散戶追漲的警示（若融資餘額增加代表什麼）")
     lines.append("   - 明日需關注的關鍵價位或事件（如指數支撐/壓力、選擇權結算日）")
