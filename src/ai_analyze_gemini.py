@@ -14,7 +14,7 @@ import re
 import time
 import random
 import requests
-import pandas as pd          # 歷史訊號資料庫讀取
+import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -99,27 +99,17 @@ def embed(summary: dict, text: str, model_used: str = ""):
 #  歷史金礦萃取器（Historical Context Extractor）
 # ─────────────────────────────────────────────────────────────────────────────
 HIST_CSV_PATH = os.path.join("data", "historical_signals.csv")
-HIST_LOOKBACK = int(os.getenv("HIST_LOOKBACK", "5"))   # 回溯幾個交易日，預設 5
+HIST_LOOKBACK = int(os.getenv("HIST_LOOKBACK", "5"))
 
 
 def extract_historical_context(summary: dict) -> str:
-    """
-    從 historical_signals.csv 萃取今日上榜個股的近期外資動向軌跡。
-
-    NaN 防彈：進入迴圈前一次性向量化清理整欄，徹底消滅 int(NaN) 地雷。
-    跨年防呆：日期顯示格式改為 MM/DD（如 04/09），不再截尾 4 碼，
-              避免 20261230 → 0105 讓 AI 誤判時序先後。
-    """
+    """從 historical_signals.csv 萃取今日上榜個股的近期動向，供 AI 判斷波段。"""
     if not os.path.exists(HIST_CSV_PATH):
-        return ""   # 第一天執行，尚無歷史資料
-
+        return ""
     try:
-        df = pd.read_csv(HIST_CSV_PATH, dtype={"代碼": str, "日期": str},
-                         encoding="utf-8-sig")
+        df = pd.read_csv(HIST_CSV_PATH, dtype={"代碼": str, "日期": str}, encoding="utf-8-sig")
         if df.empty:
             return ""
-
-        # 找出今日上榜的重點個股
         target_sids: set[str] = set()
         for block in (summary.get("top_preview") or []):
             for r in (block.get("rows") or []):
@@ -128,241 +118,177 @@ def extract_historical_context(summary: dict) -> str:
                     target_sids.add(sid)
         if not target_sids:
             return ""
-
         df_t = df[df["代碼"].isin(target_sids)].copy()
         if df_t.empty:
             return ""
-
-        # ── 關鍵防彈：向量化清理，不在迴圈內逐筆轉型 ──────────────────────
-        # pd.to_numeric errors="coerce" 將非數字轉為 NaN
-        # .fillna(0).astype(int) 確保整欄為乾淨整數，int(NaN) 地雷完全消除
         if "淨超" in df_t.columns:
-            df_t["淨超"] = (pd.to_numeric(df_t["淨超"], errors="coerce")
-                            .fillna(0).astype(int))
-
+            df_t["淨超"] = pd.to_numeric(df_t["淨超"], errors="coerce").fillna(0).astype(int)
         df_t = df_t.sort_values(["代碼", "日期"], ascending=[True, False])
-
         lines = ["【重點個股歷史波段軌跡（外資連續動向）】"]
         has_any = False
-
         for sid in sorted(target_sids):
             sdf = df_t[df_t["代碼"] == sid].head(HIST_LOOKBACK)
             if len(sdf) <= 1:
-                continue   # 只有今天，無波段參考價值
-
+                continue
             has_any = True
             name    = sdf["名稱"].iloc[0] if "名稱" in sdf.columns else sid
             sig_col = "綜合判斷" if "綜合判斷" in sdf.columns else None
-
             net_total = int(sdf["淨超"].sum()) if "淨超" in sdf.columns else 0
             buy_cnt   = int((sdf[sig_col] == "🔥可買").sum()) if sig_col else 0
-
-            # 時間軸（舊→新：.iloc[::-1] 反轉）
             ticks = []
             for _, row in sdf.iloc[::-1].iterrows():
-                # ── 跨年防呆：改用 MM/DD 格式 ──────────────────────────────
-                # 截尾 [-4:] 在跨年時（如 20261230 vs 20270105）
-                # 會讓 AI 看到 1230 → 0105，誤以為時序倒退。
-                # 改為 YYYYMMDD[4:6]/YYYYMMDD[6:8] → 04/09，清晰且跨年安全。
                 date_str = str(row["日期"])
                 mmdd = f"{date_str[4:6]}/{date_str[6:8]}"
-                net  = row.get("淨超", 0)      # 已是乾淨整數，直接用
+                net  = row.get("淨超", 0)
                 is_buy = sig_col and str(row.get(sig_col, "")) == "🔥可買"
                 icon = "🔥" if is_buy else "➖"
                 ticks.append(f"{mmdd}({icon}{net:,}張)")
             trend = " → ".join(ticks)
-
-            lines.append(
-                f"  {sid} {name}（近{len(sdf)}日累計 {net_total:,} 張，"
-                f"{buy_cnt}次🔥）：{trend}"
-            )
-
+            lines.append(f"  {sid} {name}（近{len(sdf)}日累計 {net_total:,} 張，{buy_cnt}次🔥）：{trend}")
         if not has_any:
             return ""
-
         lines.append("")
         return "\n".join(lines)
-
     except Exception as e:
         print(f"[WARN] 歷史軌跡萃取失敗（非致命）：{e}")
         return ""
 
-def build_prompt(summary: dict) -> str:
+def build_prompt(summary: dict) -> tuple[str, str]:
     """
-    v11 expert prompt：面向專業操盤手的深度籌碼分析
+    v13 System/User 完全分離：
+      sys_prompt → systemInstruction（人設/規則/格式，靜態）
+      usr_prompt → contents user role（每日變動數據）
+    Gemini 對 systemInstruction 賦予最高遵守優先級，格式遵守率接近 100%。
     """
     top_preview = summary.get("top_preview") or []
-    days = summary.get("days")
-    gen_at = summary.get("generated_at")
-    total_rows = summary.get("total_rows", 0)
-    ok = summary.get("brokers_ok", 0)
-    fail = summary.get("brokers_fail", 0)
-    errors = summary.get("errors") or []
+    days        = summary.get("days")
+    gen_at      = summary.get("generated_at")
+    total_rows  = summary.get("total_rows", 0)
+    ok          = summary.get("brokers_ok", 0)
+    fail        = summary.get("brokers_fail", 0)
+    errors      = summary.get("errors") or []
 
-    lines = []
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  [1] System Instruction — 人設、格式規則（靜態，不含每日數據）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    sys = []
+    sys.append("你是華爾街等級的台股籌碼分析師，擁有 20 年經驗，報告對象是專業操盤手與法人投資經理。")
+    sys.append("語氣要求：專業、精準、有洞察力。使用繁體中文，純文字，手機好讀格式。")
+    sys.append("分析深度：不要泛泛而談，每一點都必須有『數據佐證 → 推論邏輯 → 操作意涵』三層結構。")
+    sys.append("嚴格規則：只根據我提供的資料分析，不要編造新聞/題材/財報/K線型態。")
+    sys.append("格式：不要表格；段落間空一行；每點以 1) 2) 3) 編號；子項目用 - 開頭。")
+    sys.append("")
+    sys.append("【系統背景】")
+    sys.append("本系統為「半量化交易訊號系統」。每筆資料除外資籌碼外，已自動計算：")
+    sys.append("  進場價 = MAX(收盤,20日高) × 1.01｜停損 = 進場×0.92（-8%）")
+    sys.append("  停利1 = 進場×1.20｜停利2 = 進場×1.35｜移動停損 = 10日均線")
+    sys.append("  進場條件：突破20日高 + 放量1.5倍(≥500張) + 站上10均 + 大盤月線 + 外資淨買超")
+    sys.append("  標記【🔥可買】= 六大條件全部通過；【觀察】= 尚未觸發")
+    sys.append("  歷史軌跡符號：🔥 = 當天觸發進場訊號；➖ = 當天僅為觀察狀態（非賣出）")
+    sys.append("  資金控管：半凱利 f*/2 = (W-(1-W)/R)/2；最大張數 = 總資金×半凱利%/每張風險NT$")
+    sys.append("")
+    sys.append("請依照以下結構輸出完整報告（每區塊中間空一行）：")
+    sys.append("")
+    sys.append("A) 大盤籌碼環境研判（4~6 點）：")
+    sys.append("   每點必含：具體數據 → 推論 → 操作意涵")
+    sys.append("   涵蓋：外資/投信/自營現貨動向、法人共識度、成交量倍率、期貨籌碼方向、多空結論")
+    sys.append("")
+    sys.append("B) 外資力量 × 波段吃貨剖析（Top 3 外資，每家 4~6 點）：")
+    sys.append("   必含：操作風格判讀、【波段佈局研判—引用歷史軌跡說明是單日突擊或連續吃貨】、")
+    sys.append("         買超集中度（>50%=conviction）、乖離率分布、多空定性")
+    sys.append("")
+    sys.append("C) 明日波段操作清單（5 檔，每檔 5 行）：")
+    sys.append("   優先選股：①連續吃貨+今日🔥 ②首次🔥 ③多家外資共識")
+    sys.append("   每檔 5 行：1選入×佈局研判(引歷史軌跡) 2進場策略 3停損策略 4停利節奏 5部位風險(半凱利換算)")
+    sys.append("")
+    sys.append("D) 風控與資金配置（5~7 點）：")
+    sys.append("   必含：整體持股水位、各🔥標的半凱利最大張數換算、期貨風險程度(低/中/高)、融資警戒、關鍵價位")
+    sys.append("")
+    sys.append("E) 一句話摘要（≤30字，須含今日🔥可買訊號數量及大盤方向判斷）。")
+    sys.append("")
+    sys.append("F) 外資交叉比對亮點（3~5 點）：被 2 家以上外資同時買超的標的，格式：")
+    sys.append("   『XXXX 被 A、B 合計買超 N 張，乖離 X%，近X日第Y次🔥，暗示...』")
+    sys.append("")
+    sys.append("硬性規則：")
+    sys.append("- 全文至少 60 行。A≥5點(含數據)。B Top3 各≥4點。C 必須5檔每檔5行。D≥5點(含水位數字)。F≥3點。")
+    sys.append("- 所有數據必須與原始數據一致，不得捏造。若缺資料不得硬推論。")
+    sys.append("- 若不足 60 行或缺任一段落(A~F)，請自行補齊直到符合規則。")
 
-    # ── 角色設定（專業級） ──
-    lines.append("你是華爾街等級的台股籌碼分析師，擁有 20 年經驗，報告對象是專業操盤手與法人投資經理。")
-    lines.append("語氣要求：專業、精準、有洞察力。使用繁體中文，純文字，手機好讀格式。")
-    lines.append("分析深度：不要泛泛而談，每一點都必須有『數據佐證 → 推論邏輯 → 操作意涵』三層結構。")
-    lines.append("嚴格規則：只根據我提供的資料分析，不要編造新聞/題材/財報/K線型態。")
-    lines.append("格式：不要表格；段落間空一行；每點以 1) 2) 3) 編號；子項目用 - 開頭。")
-    lines.append("")
-    lines.append(f"報表資訊：產生時間={gen_at}；近{days}日；資料筆數={total_rows}；券商OK={ok}；FAIL={fail}")
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  [2] User Content — 每日變動數據（大盤籌碼 + 外資明細 + 歷史軌跡）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    usr = []
+    usr.append(f"報表資訊：產生時間={gen_at}；近{days}日；資料筆數={total_rows}；券商OK={ok}；FAIL={fail}")
     if errors:
-        lines.append("注意：若 FAIL>0，只能就『有資料的外資』下結論；缺資料者不得推論。")
-    lines.append("")
+        usr.append("注意：若 FAIL>0，只能就『有資料的外資』下結論；缺資料者不得推論。")
+    usr.append("")
 
-    # ── 大盤籌碼資料 ──
     market_data = summary.get("market_data") or {}
     if HAS_MARKET_FORMAT and market_data:
         market_text = format_market_context_for_prompt(market_data)
         if market_text.strip():
-            lines.append("=" * 40)
-            lines.append("【大盤籌碼原始數據】")
-            lines.append(market_text)
-            lines.append("=" * 40)
-            lines.append("")
+            usr.append("=" * 40)
+            usr.append("【大盤籌碼原始數據】")
+            usr.append(market_text)
+            usr.append("=" * 40)
+            usr.append("")
     elif market_data:
         inst = market_data.get("institutional") or []
-        if inst and len(inst) > 0:
-            today_inst = inst[0]
-            lines.append("【今日三大法人】")
-            lines.append(f"  外資淨買超: {today_inst['foreign']['net']:,} 元")
-            lines.append(f"  投信淨買超: {today_inst['trust']['net']:,} 元")
-            lines.append(f"  自營商淨買超: {today_inst['dealer']['net']:,} 元")
-            lines.append("")
+        if inst:
+            today = inst[0]
+            usr.append("【今日三大法人】")
+            usr.append(f"  外資淨買超: {today['foreign']['net']:,} 元")
+            usr.append(f"  投信淨買超: {today['trust']['net']:,} 元")
+            usr.append(f"  自營商淨買超: {today['dealer']['net']:,} 元")
+            usr.append("")
 
-    # ── 外資分點明細（增加至 7 家 × 7 檔） ──
     brokers_to_send = top_preview[:PROMPT_TOP_BROKERS]
-    lines.append(f"【外資分點明細】（依總淨超排序，前{len(brokers_to_send)}家，每家Top{PROMPT_TOP_STOCKS}）")
+    usr.append(f"【外資分點明細】（依總淨超排序，前{len(brokers_to_send)}家，每家Top{PROMPT_TOP_STOCKS}）")
     for block in brokers_to_send:
-        lines.append(f"- {block.get('broker','')}｜總淨超 {block.get('total_net',0)} 張")
+        usr.append(f"- {block.get('broker','')}｜總淨超 {block.get('total_net',0)} 張")
         for r in (block.get("rows") or [])[:PROMPT_TOP_STOCKS]:
-            # 半量化訊號欄位（新版 run_report 已產出）
-            verdict = r.get("verdict", "觀察")
-            entry   = r.get("entry",  "")
-            stop    = r.get("stop",   "")
-            tp1     = r.get("tp1",    "")
-            rr      = r.get("rr",     "")
-            risk  = r.get("risk",  "")
+            verdict  = r.get("verdict",  "觀察")
+            entry    = r.get("entry",    "")
+            stop     = r.get("stop",     "")
+            tp1      = r.get("tp1",      "")
+            rr       = r.get("rr",       "")
+            risk     = r.get("risk",     "")
+            hkelly   = r.get("hkelly",   "")
+            max_lots = r.get("max_lots",  0)
+            lot_str  = f" 最大張數:{max_lots}張" if max_lots and int(str(max_lots)) > 0 else ""
             signal_part = (
-                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1} 風報比:{rr} 每張風險:{risk}元"
+                f"｜【🔥可買】進場:{entry} 停損:{stop} 停利1:{tp1}"
+                f" 風報比:{rr} 每張風險:{risk}元 半凱利:{hkelly}%{lot_str}"
                 if "可買" in str(verdict) else "｜【觀察】"
             )
-            lines.append(
+            usr.append(
                 f"  * {r.get('sid','')} {r.get('name','')}｜淨超 {r.get('net',0)}"
                 f"｜均價 {r.get('avg','')}｜現價 {r.get('price','')}｜乖離 {r.get('bias','')}"
                 f"{signal_part}"
             )
-    lines.append("")
+    usr.append("")
 
-    # ── 千張大戶 ──
     tdcc = market_data.get("tdcc") or []
     if tdcc:
-        lines.append("【觀察個股千張大戶持股比例】")
+        usr.append("【觀察個股千張大戶持股比例】")
         for d in tdcc:
-            lines.append(f"  {d['stock_id']}｜千張以上: {d.get('holders_1000_plus',0)}人, 持股 {d.get('pct_1000_plus',0):.1f}%")
-        lines.append("")
+            usr.append(f"  {d['stock_id']}｜千張以上: {d.get('holders_1000_plus',0)}人, "
+                       f"持股 {d.get('pct_1000_plus',0):.1f}%")
+        usr.append("")
 
-    # ── 歷史波段軌跡注入（Token 控制：只送今日上榜個股的近期軌跡）───────────
+    # 歷史波段軌跡（只送今日上榜個股，控制 Token 量）
     hist_text = extract_historical_context(summary)
     if hist_text:
-        lines.append(hist_text)
+        usr.append(hist_text)
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    #  輸出結構指令（波段版 + 半量化訊號）
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    lines.append("【系統背景】")
-    lines.append("本系統為「半量化交易訊號系統」。每筆資料除外資籌碼外，已自動計算：")
-    lines.append("  進場價 = MAX(收盤,20日高) × 1.01｜停損 = 進場×0.92（-8%）")
-    lines.append("  停利1 = 進場×1.20｜停利2 = 進場×1.35｜移動停損 = 10日均線")
-    lines.append("  進場條件：突破20日高 + 放量1.5倍(≥500張) + 站上10均 + 大盤月線 + 外資淨買超")
-    lines.append("  標記【🔥可買】= 六大條件全部通過；【觀察】= 尚未觸發")
-    lines.append("  歷史軌跡符號：🔥 = 當天觸發進場訊號；➖ = 當天僅為觀察狀態（非賣出）")
-    lines.append("")
-    lines.append("請依照以下結構輸出完整報告（每區塊中間空一行）：")
-    lines.append("")
-
-    # A) 大盤環境
-    lines.append("A) 大盤籌碼環境研判（4~6 點）：")
-    lines.append("   每一點必須包含：具體數據 → 推論 → 操作意涵。")
-    lines.append("   必須涵蓋以下面向：")
-    lines.append("   - 外資/投信/自營現貨動向：直接引用【三大法人N日累計買賣超】中的累計金額與連買/連賣天數，說明近期趨勢（連買/連賣/轉折），並計算三大合計累計金額")
-    lines.append("   - 法人共識度：對照累計統計中三者趨勢標籤（連續淨買/連續淨賣/多空互見），判斷外資、投信、自營商是否同向；若背離請分析可能原因")
-    lines.append("   - 成交量分析：今日量能 vs 5日均量（放量/縮量/爆量倍率），量價配合度")
-    lines.append("   - 期貨籌碼：外資台指期淨部位方向與變化幅度，多空轉折訊號")
-    lines.append("   - 多空結論：綜合以上，明確給出『偏多/中性/偏空』判斷及信心程度（高/中/低）")
-    lines.append("")
-
-    # B) 外資排行（升級：加入波段佈局研判）
-    lines.append("B) 外資力量 × 波段吃貨剖析（Top 3 外資，每家 4~6 點）：")
-    lines.append("   每家外資需分析：")
-    lines.append("   - 操作風格判讀：根據持股特徵（大型/中小型、電子/金融/傳產）判斷該外資近期策略")
-    lines.append("   - 【重要】波段佈局研判：結合【重點個股歷史波段軌跡】，指出該外資是『單日突擊』")
-    lines.append("     還是『連續數日吃貨佈局』？連續出現🔥代表外資在關鍵價位反覆加碼（conviction 升高）")
-    lines.append("   - 買超集中度：前3大標的佔總淨超比例，若>50%代表高度集中（conviction trade）")
-    lines.append("   - 乖離率分布：多數標的乖離正/負？正乖離高代表『追漲/強勢佈局』，負乖離多代表『逢低承接/被套』")
-    lines.append("   - 跨外資交叉驗證：同一標的是否被多家外資同時買超？若是，代表共識度高")
-    lines.append("   - 多空定性：該外資整體偏多/偏空/中性，附帶簡短理由")
-    lines.append("")
-
-    # C) 觀察清單（升級：波段佈局 + 半量化訊號 + 歷史軌跡）
-    lines.append("C) 明日波段操作清單（5 檔，每檔 5 行）：")
-    lines.append("   選股邏輯（優先順序）：")
-    lines.append("   ①『連續多日買超 + 今日🔥可買』（波段吃貨確認，勝率最高）")
-    lines.append("   ②『今日首次🔥可買』（剛突破，需觀察是否延續）")
-    lines.append("   ③ 多家外資共識 + 淨超張數大且正乖離（籌碼補充）")
-    lines.append("   若🔥可買個股不足5檔，以籌碼面補足。每檔必須包含以下五行：")
-    lines.append("   1) 選入 × 佈局研判：結合【歷史波段軌跡】，說明外資是剛開始試單、")
-    lines.append("      連續吃貨、還是今日轉折？引用軌跡數據（如『連續3日累計X張，第2次🔥』）")
-    lines.append("   2) 進場策略：直接引用系統計算的進場價（若為🔥可買標的）；或自行根據籌碼推估觸發條件")
-    lines.append("   3) 停損策略：直接引用系統停損價（進場×0.92，即-8%）；說明停損邏輯（收盤跌破/盤中跌破）")
-    lines.append("   4) 停利策略：停利1（+20%）和停利2（+35%）的分批了結節奏；並說明10均移動停損啟動時機")
-    lines.append("   5) 部位與風險：每張風險NT$×半凱利%換算最大張數；建議倉位（試單0.5×/標準1×/連續吃貨可1.5×）")
-    lines.append("   - 若有千張大戶資料，請分析大戶籌碼集中度對股價支撐/壓力的影響。")
-    lines.append("")
-
-    # D) 風控
-    lines.append("D) 風控與資金配置（5~7 點）：")
-    lines.append("   不是泛泛的『注意風險』，而是基於數據的具體建議：")
-    lines.append("   - 整體持股水位建議（如『建議總持股不超過6成』）及理由")
-    lines.append("   - 單一標的最大部位上限")
-    lines.append("   - 根據外資期貨空單水位，判斷系統性風險程度（低/中/高）")
-    lines.append("   - 融資水位對散戶追漲的警示（若融資餘額增加代表什麼）")
-    lines.append("   - 明日需關注的關鍵價位或事件（如指數支撐/壓力、選擇權結算日）")
-    lines.append("   - 若外資現貨與期貨方向矛盾，分析可能的策略意圖（避險？換倉？）")
-    lines.append("")
-
-    # E) 摘要
-    lines.append("E) 一句話摘要（≤30字，須含今日🔥可買訊號數量及大盤方向判斷）。")
-    lines.append("")
-
-    # F) 交叉比對
-    lines.append("F) 外資交叉比對亮點（3~5 點）：")
-    lines.append("   找出被 2 家以上外資同時買超的標的，分析共識度與潛在意義。")
-    lines.append("   格式：『XXXX 股名被 A、B、C 三家外資合計買超 N 張，乖離率 X%，暗示...』")
-    lines.append("")
-
-    # 硬性規則
-    lines.append("硬性規則：")
-    lines.append("- 全文至少 60 行（含標題與編號行）。")
-    lines.append("- A 段至少 5 點，每點需引用具體數據。B 段 Top3 外資各至少 4 點。")
-    lines.append("- C 必須 5 檔、每檔 5 行（選入理由/進場/停損/了結/部位）。")
-    lines.append("- D 段至少 5 點，必須包含具體持股水位數字。")
-    lines.append("- F 段至少 3 點交叉比對。")
-    lines.append("- 所有數據引用必須與我提供的原始數據一致，不得捏造。")
-    lines.append("- 若不足 60 行或缺任一段落(A~F)，請自行補齊直到符合規則。")
-
-    return "\n".join(lines)
+    return "\n".join(sys), "\n".join(usr)
 
 
-def fixup_prompt(draft: str) -> str:
+def make_fixup_usr(draft: str) -> str:
+    """Fixup 時的 user content：system 維持不變，只送草稿讓 Gemini 補強。"""
     return "\n".join([
-        "你是華爾街等級的台股籌碼分析師。以下草稿不完整或不夠深入，請你『補齊並強化』後輸出完整 A~F。",
-        "硬性規則：全文至少60行；A至少5點(含數據)；B Top3外資各至少4點；C 5檔每檔5行；D至少5點(含持股水位)；F至少3點交叉比對。",
-        "每一點都要有『數據 → 推論 → 操作意涵』三層結構。",
-        "請直接輸出『完整版本』，保持純文字、段落間空一行、每點用 1) 2) 3)。",
+        "以下草稿不完整或不夠深入，請根據【系統背景】與格式規則『直接補齊並輸出完整 A~F』。",
+        "請勿解釋，直接輸出完整報告。",
         "",
         "【草稿開始】",
         (draft or "").strip(),
@@ -380,7 +306,7 @@ def is_quota_exceeded(status_code: int, body_text: str) -> bool:
     return "quota" in body_text.lower() or "billing" in body_text.lower()
 
 
-def call_gemini_single(prompt: str, model: str) -> str:
+def call_gemini_single(sys_text: str, usr_text: str, model: str) -> str:
     """
     對單一模型呼叫 Gemini API，支援 5xx 重試。
     若遇到 429 Quota Exceeded，直接拋出不重試（交給外層 fallback）。
@@ -399,35 +325,11 @@ def call_gemini_single(prompt: str, model: str) -> str:
     if MAX_OUT is not None:
         gen_cfg["maxOutputTokens"] = MAX_OUT
 
-    # ── System / User 分離（Prompt Engineering 最佳實踐）──────────────────
-    # 將「角色設定 + 硬性規則」放入 systemInstruction，讓 Gemini 更嚴格遵守格式。
-    # 「每日變動數據」放入 contents，兩者職責清晰，格式遵守率接近 100%。
-    # 分割標記：prompt 的前半段（角色/規則/格式）為 system，後半段（數據）為 user。
-    SYSTEM_MARKER = "【大盤籌碼原始數據】"
-    ALT_MARKER    = "報表資訊："   # fallback：若無大盤資料區塊
-    split_at = prompt.find(SYSTEM_MARKER)
-    if split_at < 0:
-        split_at = prompt.find(ALT_MARKER)
-
-    if split_at > 0:
-        system_text = prompt[:split_at].strip()
-        user_text   = prompt[split_at:].strip()
-    else:
-        # 無法分割時退回單一 contents（完全向下相容）
-        system_text = None
-        user_text   = prompt
-
-    if system_text:
-        payload = {
-            "systemInstruction": {"parts": [{"text": system_text}]},
-            "contents":          [{"role": "user", "parts": [{"text": user_text}]}],
-            "generationConfig":  gen_cfg,
-        }
-    else:
-        payload = {
-            "contents":         [{"parts": [{"text": user_text}]}],
-            "generationConfig": gen_cfg,
-        }
+    payload = {
+        "systemInstruction": {"parts": [{"text": sys_text}]},
+        "contents": [{"role": "user", "parts": [{"text": usr_text}]}],
+        "generationConfig": gen_cfg,
+    }
 
     last_exc = None
 
@@ -492,7 +394,7 @@ class QuotaExceededError(RuntimeError):
     pass
 
 
-def call_gemini_with_fallback(prompt: str) -> tuple[str, str]:
+def call_gemini_with_fallback(sys_text: str, usr_text: str) -> tuple[str, str]:
     """
     依序嘗試 PRIMARY_MODEL → FALLBACK_MODELS，直到成功。
     回傳 (response_text, model_used)。
@@ -507,7 +409,7 @@ def call_gemini_with_fallback(prompt: str) -> tuple[str, str]:
     for model in models_to_try:
         try:
             print(f"[INFO] 嘗試模型: {model}")
-            text = call_gemini_single(prompt, model)
+            text = call_gemini_single(sys_text, usr_text, model)
             print(f"[OK] {model} 回應成功 ({len(text)} chars)")
             return text, model
         except QuotaExceededError as e:
@@ -580,8 +482,8 @@ def validate(text: str) -> list:
 # ── 主程式 ──────────────────────────────────────────
 
 def main():
-    summary = load_summary()
-    prompt = build_prompt(summary)
+    summary    = load_summary()
+    sys_prompt, usr_prompt = build_prompt(summary)
 
     print("=" * 60)
     print(f"[INFO] analyzer     = {ANALYZER_VERSION}")
@@ -589,7 +491,8 @@ def main():
     print(f"[INFO] fallbacks    = {FALLBACK_MODELS}")
     print(f"[INFO] temperature  = {TEMP}")
     print(f"[INFO] maxOutTokens = {'NONE' if MAX_OUT is None else MAX_OUT}")
-    print(f"[INFO] prompt_len   = {len(prompt)} chars")
+    print(f"[INFO] sys_len      = {len(sys_prompt)} chars")
+    print(f"[INFO] usr_len      = {len(usr_prompt)} chars")
     print(f"[INFO] enable_fixup = {ENABLE_FIXUP}")
     print(f"[INFO] prompt_brokers={PROMPT_TOP_BROKERS} stocks={PROMPT_TOP_STOCKS}")
     print("=" * 60)
@@ -597,15 +500,17 @@ def main():
     model_used = PRIMARY_MODEL
 
     try:
-        # ── 第一次呼叫 ──
-        draft, model_used = call_gemini_with_fallback(prompt)
+        # ── 第一次呼叫（system + user 完全分離）──
+        draft, model_used = call_gemini_with_fallback(sys_prompt, usr_prompt)
         p1 = validate(draft)
 
         if p1 and ENABLE_FIXUP:
             print(f"[WARN] 第一次驗證未通過: {'; '.join(p1)}")
-            print("[INFO] 執行 fixup pass...")
+            print("[INFO] 執行 fixup pass（system 不變，user 送草稿）...")
             try:
-                final_text, model_used = call_gemini_with_fallback(fixup_prompt(draft))
+                # System 維持不變（規則底層強制），User 改為「草稿修補」
+                fixup_usr  = make_fixup_usr(draft)
+                final_text, model_used = call_gemini_with_fallback(sys_prompt, fixup_usr)
                 p2 = validate(final_text)
                 if p2:
                     print(f"[WARN] fixup 後仍未完全通過: {'; '.join(p2)}（仍使用此結果）")
