@@ -403,38 +403,13 @@ def calc_signals(tech: dict, net_qty: int, taiex_above_ma20: bool) -> dict:
                 and taiex_above_ma20 and is_net_buy and is_above_ma10)
     verdict  = "🔥可買" if all_pass else "觀察"
 
-    # ── 風報比（Risk / Reward Ratio）────────────────────────────────────────────
+    # 優化三：風報比（Risk / Reward Ratio）
+    # 每張風險 = (進場價 - 停損價) × 1000 股，讓操盤手直接看 NT$ 曝險
     risk_per_lot   = round((entry - stop) * 1000, 0) if entry > stop else 0.0
     reward_tp1_lot = round((tp1   - entry) * 1000, 0) if tp1 > entry else 0.0
     reward_tp2_lot = round((tp2   - entry) * 1000, 0) if tp2 > entry else 0.0
+    # R/R 比 = 潛在獲利 / 潛在損失（以 TP1 為基準）；固定公式下恆為 2.5
     rr_ratio = round(reward_tp1_lot / risk_per_lot, 2) if risk_per_lot > 0 else 0.0
-
-    # ── 凱利公式（Kelly Criterion）完整資金控管 ──────────────────────────────
-    # 公式：f* = W - (1-W)/R
-    #   W = 策略勝率（環境變數 WIN_RATE，預設 55%）
-    #   R = 風報比（rr_ratio）
-    #   f* = 每筆交易建議「停損金額」佔總資金的最大比例
-    # 半凱利（Half-Kelly）= f*/2，換取更平穩的資金曲線（實務首選）
-    #
-    # TOTAL_CAPITAL（環境變數，NT$）= 你的操作總資金
-    #   設定後系統直接計算：最大張數 = 總資金 × 半凱利% / 每張風險NT$
-    #   不設定（= 0）則只顯示百分比，由你自行換算
-    WIN_W          = float(os.getenv("WIN_RATE",      os.getenv("KELLY_WIN_RATE", "0.55")))
-    TOTAL_CAPITAL  = float(os.getenv("TOTAL_CAPITAL", "0"))   # 0 = 未設定
-
-    if rr_ratio > 0 and WIN_W > 0:
-        kelly_full = max(0.0, WIN_W - (1 - WIN_W) / rr_ratio)
-        half_kelly = kelly_full / 2.0
-    else:
-        kelly_full = 0.0
-        half_kelly = 0.0
-
-    # 最大張數：僅在 TOTAL_CAPITAL > 0 且每張風險 > 0 時計算
-    if TOTAL_CAPITAL > 0 and risk_per_lot > 0 and half_kelly > 0:
-        import math
-        max_lots = math.floor(TOTAL_CAPITAL * half_kelly / risk_per_lot)
-    else:
-        max_lots = 0   # 0 = 未設定總資金，請自行換算
 
     return {
         "進場價":       entry,
@@ -445,9 +420,6 @@ def calc_signals(tech: dict, net_qty: int, taiex_above_ma20: bool) -> dict:
         "每張風險NT$":  int(risk_per_lot),
         "每張獲利NT$":  int(reward_tp1_lot),
         "風報比":       rr_ratio,
-        "全凱利%":      round(kelly_full * 100, 1),
-        "半凱利%":      round(half_kelly * 100, 1),
-        "最大張數":     max_lots,   # 半凱利資金控管下的最大可買張數
         "突破20日高":   "✅" if is_breakout      else "❌",
         "放量1.5倍":    "✅" if is_high_vol      else "❌",
         "流動性足夠":   "✅" if is_liquid        else "❌",
@@ -483,8 +455,8 @@ REPORT_COLUMNS = [
     "20日高", "10日均", "5日均量", "今日高", "今日量",
     # 價格訊號
     "進場價", "停損價", "停利1", "停利2", "移動停損",
-    # 風報比 + 凱利資金控管
-    "每張風險NT$", "每張獲利NT$", "風報比", "全凱利%", "半凱利%", "最大張數",
+    # 風報比（優化三）
+    "每張風險NT$", "每張獲利NT$", "風報比",
     # 布林訊號
     "突破20日高", "放量1.5倍", "流動性足夠", "站上10均", "大盤站月線",
     "綜合判斷",
@@ -672,10 +644,7 @@ def build_report(days: int):
                         "tp2":     r["停利2"],
                         "rr":      r["風報比"],        # mailer / AI prompt 風報比
                         "risk":    r["每張風險NT$"],   # 每張風險金額（NT$）
-                        "kelly":    r["全凱利%"],
-                        "hkelly":   r["半凱利%"],
-                        "max_lots": r["最大張數"],
-                        "verdict":  r["綜合判斷"],
+                        "verdict": r["綜合判斷"],
                     }
                     for _, r in sub.iterrows()
                 ],
@@ -696,21 +665,21 @@ def build_report(days: int):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Excel 輸出
 # ─────────────────────────────────────────────────────────────────────────────
-# REPORT_COLUMNS（32欄）完整對照表（A → AF）
+# REPORT_COLUMNS（29欄）完整對照表（A → AC）
 # A  日期      B  代碼      C  名稱      D  大戶
 # E  買進      F  賣出      G  淨超      H  區間均價   I  現價      J  乖離率
 # K  20日高    L  10日均    M  5日均量   N  今日高     O  今日量
 # P  進場價    Q  停損價    R  停利1     S  停利2      T  移動停損
-# U  每張風險NT$  V  每張獲利NT$  W  風報比  X  全凱利%  Y  半凱利%  Z  最大張數
-# AA 突破20日高  AB 放量1.5倍  AC 流動性足夠  AD 站上10均  AE 大盤站月線  AF 綜合判斷
+# U  每張風險NT$  V  每張獲利NT$  W  風報比
+# X  突破20日高  Y  放量1.5倍  Z  流動性足夠  AA  站上10均  AB  大盤站月線  AC  綜合判斷
 _COL_WIDTHS = {
     "A": 10, "B":  8, "C": 14, "D": 35,        # 日期/代碼/名稱/大戶
     "E": 10, "F": 10, "G": 10, "H": 12,        # 買進/賣出/淨超/區間均價
     "I": 10, "J": 10,                            # 現價/乖離率
     "K": 10, "L": 10, "M": 10, "N": 10, "O": 10,  # 技術面五欄
     "P": 10, "Q": 10, "R": 10, "S": 10, "T": 10,  # 訊號價格五欄
-    "U": 13, "V": 13, "W": 10, "X": 10, "Y": 10, "Z": 10,  # 風報比+凱利+最大張數
-    "AA": 12, "AB": 12, "AC": 12, "AD": 12, "AE": 12, "AF": 15,  # 布林訊號(5)+綜合判斷
+    "U": 13, "V": 13, "W": 10,                  # 風報比三欄
+    "X": 12, "Y": 12, "Z": 12, "AA": 12, "AB": 12, "AC": 15,  # 布林訊號(5) + 綜合判斷
 }
 
 
@@ -768,30 +737,6 @@ def export_excel(df: pd.DataFrame, fail_df: pd.DataFrame, xlsx_path: str):
             ws.conditional_formatting.add(rng_rr, FormulaRule(
                 formula=[f'=AND(${rr_col}2>0,${rr_col}2<2)'],
                 fill=fill_rr_bad, stopIfTrue=True))
-
-            # 半凱利%（Y欄）：≥15% 藍底（充裕）；<10% 橙底（謹慎）
-            hk_col = get_column_letter(REPORT_COLUMNS.index("半凱利%") + 1)
-            rng_hk = f"{hk_col}2:{hk_col}{last_row}"
-            fill_hk_good = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-            fill_hk_warn = PatternFill(start_color="FFE0B2", end_color="FFE0B2", fill_type="solid")
-            ws.conditional_formatting.add(rng_hk, FormulaRule(
-                formula=[f'=${hk_col}2>=15'],
-                fill=fill_hk_good, stopIfTrue=True))
-            ws.conditional_formatting.add(rng_hk, FormulaRule(
-                formula=[f'=AND(${hk_col}2>0,${hk_col}2<10)'],
-                fill=fill_hk_warn, stopIfTrue=True))
-
-            # 最大張數（Z欄）：> 0 且 ≤ 10 → 橙底提醒（量少需謹慎）；= 0 → 灰色（未設定）
-            ml_col = get_column_letter(REPORT_COLUMNS.index("最大張數") + 1)
-            rng_ml = f"{ml_col}2:{ml_col}{last_row}"
-            fill_ml_ok   = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            fill_ml_warn = PatternFill(start_color="FFE0B2", end_color="FFE0B2", fill_type="solid")
-            ws.conditional_formatting.add(rng_ml, FormulaRule(
-                formula=[f'=${ml_col}2>10'],
-                fill=fill_ml_ok, stopIfTrue=True))
-            ws.conditional_formatting.add(rng_ml, FormulaRule(
-                formula=[f'=AND(${ml_col}2>0,${ml_col}2<=10)'],
-                fill=fill_ml_warn, stopIfTrue=True))
 
             # 站上10均（空頭防禦欄）：❌ → 橙底警示
             ma10_col = get_column_letter(REPORT_COLUMNS.index("站上10均") + 1)
@@ -902,11 +847,9 @@ def export_pdf(df: pd.DataFrame, pdf_path: str, summary: dict):
         ("停利1",     44, sty_r, False),
         ("停利2",     44, sty_r, False),
         ("每張風險",  44, sty_r, False),  # 每張風險NT$縮短
-        ("風報比",    30, sty_c, False),
-        ("半凱利%",   28, sty_c, False),  # 資金控管比例
-        ("最大張數",  28, sty_c, False),  # 半凱利換算可買張數（需設TOTAL_CAPITAL）
-        ("訊號",      45, sty_c, True),
-        ("4條件",     42, sty_c, True),
+        ("風報比",    36, sty_c, False),
+        ("訊號",      52, sty_c, True),   # 綜合判斷
+        ("4條件",     48, sty_c, True),   # 突破+放量+流動+月線合併
     ]
 
     # 原始欄名映射
@@ -924,11 +867,8 @@ def export_pdf(df: pd.DataFrame, pdf_path: str, summary: dict):
         "停利2":  "停利2",
         "每張風險": "每張風險NT$",
         "風報比": "風報比",
-        "風報比":   "風報比",
-        "半凱利%":  "半凱利%",
-        "最大張數": "最大張數",
-        "訊號":     "綜合判斷",
-        "4條件":    "_cond",
+        "訊號":   "綜合判斷",   # 直接取綜合判斷
+        "4條件":  "_cond",       # 組合欄，特殊處理
     }
 
     col_names  = [d[0] for d in COL_DEFS]
@@ -1005,6 +945,97 @@ def export_pdf(df: pd.DataFrame, pdf_path: str, summary: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 #  主程式
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  歷史訊號資料庫（Historical Signals Database）
+# ─────────────────────────────────────────────────────────────────────────────
+# 設計原則：
+#   - 每天執行後，append 當日所有訊號到 data/historical_signals.csv
+#   - 以「日期」為去重鍵（冪等性）：同一天重跑幾次都只保留最新一份
+#   - 排序：日期降冪（新→舊），方便 tail/預覽
+#   - utf-8-sig 編碼：Excel 開啟中文不亂碼
+#   - data/ 目錄 commit 到 Repo，GitHub Actions 每日自動 push → 永久累積
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 回測核心欄位（只存必要欄位，減少檔案大小；可依需求增減）
+HIST_COLS = [
+    "日期", "代碼", "名稱", "大戶", "淨超", "區間均價", "現價", "乖離率",
+    "20日高", "10日均", "5日均量", "今日高", "今日量",
+    "進場價", "停損價", "停利1", "停利2", "移動停損",
+    "每張風險NT$", "每張獲利NT$", "風報比",
+    "突破20日高", "放量1.5倍", "流動性足夠", "站上10均", "大盤站月線",
+    "綜合判斷",
+]
+
+HIST_PATH = os.path.join("data", "historical_signals.csv")
+
+
+def append_historical_signals(df: pd.DataFrame) -> dict:
+    """
+    儲存每日交易訊號至 data/historical_signals.csv。
+
+    冪等性設計：
+      先刪除舊檔中「與本次日期相同」的所有列，再合併寫入。
+      同一天重複執行不會產生重複紀錄。
+
+    回傳操作摘要 dict，供 summary.json 記錄與終端輸出。
+    """
+    if df is None or df.empty:
+        return {"status": "skipped", "reason": "empty dataframe"}
+
+    os.makedirs("data", exist_ok=True)
+
+    # 只保留 df 中實際存在的欄位（避免 KeyError）
+    avail_cols = [c for c in HIST_COLS if c in df.columns]
+    new_df = df[avail_cols].copy()
+    new_df["日期"] = new_df["日期"].astype(str)
+    today_date = new_df["日期"].iloc[0] if not new_df.empty else ""
+    new_rows   = len(new_df)
+
+    # 讀取舊檔（若存在）
+    if os.path.exists(HIST_PATH):
+        try:
+            old_df = pd.read_csv(HIST_PATH, dtype={"代碼": str, "日期": str},
+                                 encoding="utf-8-sig")
+        except Exception as e:
+            print(f"[WARN] 讀取歷史資料庫失敗，將重建：{e}")
+            old_df = pd.DataFrame(columns=avail_cols)
+    else:
+        old_df = pd.DataFrame(columns=avail_cols)
+
+    # 冪等核心：刪除舊資料中「與本次日期相同」的所有列
+    new_dates = new_df["日期"].unique()
+    replaced  = 0
+    if not old_df.empty and "日期" in old_df.columns:
+        mask     = old_df["日期"].astype(str).isin(new_dates)
+        replaced = int(mask.sum())
+        old_df   = old_df[~mask]
+
+    # 合併、排序（日期降冪=新到舊，代碼升冪）
+    combined = pd.concat([old_df, new_df], ignore_index=True)
+    if "日期" in combined.columns:
+        sort_cols = ["日期", "代碼"] if "代碼" in combined.columns else ["日期"]
+        combined = combined.sort_values(
+            by=sort_cols, ascending=[False, True] if len(sort_cols) == 2 else [False]
+        ).reset_index(drop=True)
+
+    combined.to_csv(HIST_PATH, index=False, encoding="utf-8-sig")
+
+    unique_dates = combined["日期"].nunique() if "日期" in combined.columns else 0
+    total_rows   = len(combined)
+    buy_count    = int((new_df.get("綜合判斷", pd.Series()) == "🔥可買").sum())
+
+    return {
+        "status":        "ok",
+        "hist_path":     HIST_PATH,
+        "today_date":    today_date,
+        "new_rows":      new_rows,
+        "replaced_rows": replaced,
+        "total_rows":    total_rows,
+        "unique_dates":  unique_dates,
+        "buy_signals":   buy_count,
+    }
+
 def main():
     ensure_output_dir()
     days = int(os.getenv("DAYS", str(DEFAULT_DAYS)))
@@ -1018,6 +1049,17 @@ def main():
 
     export_excel(df, fail_df, xlsx_path)
     export_pdf(df, pdf_path, summary)
+
+    # ── 歷史訊號資料庫（每日 append，GitHub Actions 自動 commit）────────────
+    hist = append_historical_signals(df)
+    if hist.get("status") == "ok":
+        print(f"[OK] HistDB : {hist['hist_path']}"
+              f"  今日+{hist['new_rows']}筆"
+              f"  累計{hist['total_rows']}筆/{hist['unique_dates']}交易日"
+              f"  🔥{hist['buy_signals']}檔可買")
+        summary["historical_db"] = hist
+    else:
+        print(f"[INFO] HistDB: {hist}")
 
     # ── 大盤籌碼 ──────────────────────────────────────────────────────────────
     if HAS_MARKET_DATA and os.getenv("MARKET_DATA", "1") == "1":
