@@ -403,13 +403,42 @@ def calc_signals(tech: dict, net_qty: int, taiex_above_ma20: bool) -> dict:
                 and taiex_above_ma20 and is_net_buy and is_above_ma10)
     verdict  = "🔥可買" if all_pass else "觀察"
 
-    # 優化三：風報比（Risk / Reward Ratio）
-    # 每張風險 = (進場價 - 停損價) × 1000 股，讓操盤手直接看 NT$ 曝險
+    # ── 風報比（Risk / Reward Ratio）────────────────────────────────────────────
     risk_per_lot   = round((entry - stop) * 1000, 0) if entry > stop else 0.0
     reward_tp1_lot = round((tp1   - entry) * 1000, 0) if tp1 > entry else 0.0
     reward_tp2_lot = round((tp2   - entry) * 1000, 0) if tp2 > entry else 0.0
-    # R/R 比 = 潛在獲利 / 潛在損失（以 TP1 為基準）；固定公式下恆為 2.5
     rr_ratio = round(reward_tp1_lot / risk_per_lot, 2) if risk_per_lot > 0 else 0.0
+
+    # ── 凱利公式（Kelly Criterion）完整資金控管 ──────────────────────────────
+    # f* = W - (1-W)/R；半凱利 = f*/2
+    WIN_W         = float(os.getenv("WIN_RATE",      os.getenv("KELLY_WIN_RATE", "0.55")))
+    TOTAL_CAPITAL = float(os.getenv("TOTAL_CAPITAL", "0"))
+
+    if rr_ratio > 0 and WIN_W > 0:
+        kelly_full = max(0.0, WIN_W - (1 - WIN_W) / rr_ratio)
+        half_kelly = kelly_full / 2.0
+    else:
+        kelly_full = 0.0
+        half_kelly = 0.0
+
+    # 整張：最大可買張數（停損金額 = 每張風險NT$）
+    if TOTAL_CAPITAL > 0 and risk_per_lot > 0 and half_kelly > 0:
+        import math
+        max_lots = math.floor(TOTAL_CAPITAL * half_kelly / risk_per_lot)
+    else:
+        max_lots = 0
+
+    # ── 零股數量（前導測試核心欄位）──────────────────────────────────────────
+    # 每股風險 = 進場價 - 停損價（整張風險 ÷ 1000）
+    # 優化一：向下取整至 10 的倍數，確保盤中零股掛單好成交、降低滑價
+    #   raw_shares = floor(總資金 × 半凱利% / 每股風險)
+    #   max_shares = (raw_shares // 10) * 10  ← 184股 → 180股
+    risk_per_share = (entry - stop) if entry > stop else 0.0
+    if TOTAL_CAPITAL > 0 and risk_per_share > 0 and half_kelly > 0:
+        raw_shares = math.floor(TOTAL_CAPITAL * half_kelly / risk_per_share)
+        max_shares = (raw_shares // 10) * 10   # 向下取整至10的倍數，成交更順暢
+    else:
+        max_shares = 0
 
     return {
         "進場價":       entry,
@@ -420,6 +449,10 @@ def calc_signals(tech: dict, net_qty: int, taiex_above_ma20: bool) -> dict:
         "每張風險NT$":  int(risk_per_lot),
         "每張獲利NT$":  int(reward_tp1_lot),
         "風報比":       rr_ratio,
+        "全凱利%":      round(kelly_full * 100, 1),
+        "半凱利%":      round(half_kelly * 100, 1),
+        "最大張數":     max_lots,
+        "建議零股數":   max_shares,   # 已取整至10的倍數，前導測試實戰用
         "突破20日高":   "✅" if is_breakout      else "❌",
         "放量1.5倍":    "✅" if is_high_vol      else "❌",
         "流動性足夠":   "✅" if is_liquid        else "❌",
@@ -455,8 +488,8 @@ REPORT_COLUMNS = [
     "20日高", "10日均", "5日均量", "今日高", "今日量",
     # 價格訊號
     "進場價", "停損價", "停利1", "停利2", "移動停損",
-    # 風報比（優化三）
-    "每張風險NT$", "每張獲利NT$", "風報比",
+    # 風報比 + 凱利 + 零股
+    "每張風險NT$", "每張獲利NT$", "風報比", "全凱利%", "半凱利%", "最大張數", "建議零股數",
     # 布林訊號
     "突破20日高", "放量1.5倍", "流動性足夠", "站上10均", "大盤站月線",
     "綜合判斷",
@@ -642,9 +675,13 @@ def build_report(days: int):
                         "stop":    r["停損價"],
                         "tp1":     r["停利1"],
                         "tp2":     r["停利2"],
-                        "rr":      r["風報比"],        # mailer / AI prompt 風報比
-                        "risk":    r["每張風險NT$"],   # 每張風險金額（NT$）
-                        "verdict": r["綜合判斷"],
+                        "rr":       r["風報比"],
+                        "risk":     r["每張風險NT$"],
+                        "kelly":    r.get("全凱利%",    0),
+                        "hkelly":   r.get("半凱利%",    0),
+                        "max_lots": r.get("最大張數",   0),
+                        "shares":   r.get("建議零股數", 0),
+                        "verdict":  r["綜合判斷"],
                     }
                     for _, r in sub.iterrows()
                 ],

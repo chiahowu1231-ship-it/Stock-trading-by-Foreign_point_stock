@@ -957,14 +957,16 @@ def build_html(summary: dict) -> str:
             'letter-spacing:1px;">🔥 半量化進場訊號（今日符合進場條件）</span></div>'
         )
         sig_tbl = _table_open([
-            ("auto",""), ("52px",""), ("60px",""), ("60px",""), ("60px",""),
-            ("60px",""), ("45px",""), ("68px",""), ("48px",""), ("60px",""), ("65px",""),
+            ("auto",""), ("48px",""), ("58px",""), ("58px",""), ("58px",""),
+            ("58px",""), ("42px",""), ("62px",""), ("44px",""), ("54px",""), ("58px",""), ("60px",""),
         ])
         sig_tbl += _th_row(
             ("代號　名稱", "left"), ("現價", "right"), ("進場價", "right"),
             ("停損價", "right"), ("停利1", "right"), ("停利2", "right"),
             ("風報比", "right"), ("每張風險NT$", "right"),
-            ("半凱利%", "right"), ("最大張數", "right"), ("外資券商", "center"),
+            ("半凱利%", "right"), ("最大張數", "right"),
+            ("零股數 ★", "right"),   # 前導測試核心欄位，取整至10倍數
+            ("外資券商", "center"),
             bg="#7D6608",
         )
         for si, r in enumerate(buy_signals):
@@ -974,6 +976,7 @@ def build_html(summary: dict) -> str:
             rr       = r.get("rr",       "-"); price    = r.get("price",   "-")
             risk     = r.get("risk",     "-"); hkelly   = r.get("hkelly",  "-")
             max_lots = r.get("max_lots",  0)
+            shares   = r.get("shares",    0)   # 建議零股數（已取整至10的倍數）
             # 每張風險色階
             try:
                 risk_num   = int(str(risk).replace(",",""))
@@ -986,13 +989,24 @@ def build_html(summary: dict) -> str:
                 hk_color = "#1A5276" if hk_num >= 15 else "#E67E22" if hk_num < 10 else "#555"
             except Exception:
                 hk_color = "#555"
-            # 最大張數：0=未設定總資金，顯示提示；>0=可買張數
+            # 最大張數
             if max_lots and int(str(max_lots)) > 0:
                 ml_num   = int(str(max_lots))
                 ml_color = "#1A7A4A" if ml_num > 10 else "#E67E22"
                 ml_html  = f'<span style="color:{ml_color};font-weight:800;font-size:13px;">{ml_num} 張</span>'
             else:
                 ml_html  = '<span style="color:#AAA;font-size:10px;">未設定</span>'
+            # 建議零股數（已取整至10倍數，0=未設定或風險過高）
+            if shares and int(str(shares)) > 0:
+                sh_num = int(str(shares))
+                # ≥1000股=深綠（可分批），100~999=綠，10~99=橙（小量試單），<10=警示
+                sh_color = ("#1A7A4A" if sh_num >= 1000 else
+                            "#27AE60" if sh_num >= 100 else
+                            "#E67E22" if sh_num >= 10 else "#C0392B")
+                sh_html = (f'<span style="color:{sh_color};font-weight:800;font-size:14px;">'
+                           f'{sh_num} 股</span>')
+            else:
+                sh_html = '<span style="color:#AAA;font-size:10px;">0（風險超限）</span>'
             sig_tbl += _tr(
                 _td(f'<span style="font-weight:700;color:#1A5276;">{_esc(r.get("sid",""))}</span>'
                     f'&nbsp;<span style="font-weight:600;">{_esc(r.get("name",""))}</span>'),
@@ -1005,6 +1019,7 @@ def build_html(summary: dict) -> str:
                 _td(f'<span style="color:{risk_color};font-weight:700;">{_esc(str(risk))}</span>', "right"),
                 _td(f'<span style="color:{hk_color};font-weight:700;">{_esc(str(hkelly))}%</span>', "right"),
                 _td(ml_html, "right"),
+                _td(sh_html, "right"),
                 _td(f'<span style="font-size:11px;color:#555;">{_esc(r.get("_broker",""))}</span>', "center"),
                 bg=bg,
             )
