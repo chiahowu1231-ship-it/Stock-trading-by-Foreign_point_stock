@@ -9,6 +9,12 @@ on:
 permissions:
   contents: write
 
+# 並發鎖：同一時間只允許一個 workflow 執行，重複觸發時取消舊的
+# 防止手動重複觸發導致兩個機器人同時寫入同一個 CSV
+concurrency:
+  group: "semi-quant-report"
+  cancel-in-progress: true
+
 jobs:
   report:
     runs-on: ubuntu-latest
@@ -25,14 +31,19 @@ jobs:
       MARKET_DATA: "1"
       MARKET_HISTORY_DAYS: "6"   # 抓取天數（含當天+前5天）
 
+      # ✅ 半凱利資金控管 + 零股前導測試
+      TOTAL_CAPITAL: "100000"    # 10 萬台幣零股前導測試（設 0 = 只顯示百分比）
+      WIN_RATE: "0.55"           # 策略勝率，累積歷史紀錄後再調整
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: 'pip'            # 自動快取 requirements.txt，省下每次安裝的 30 秒
 
       - name: Install dependencies
         run: |
@@ -41,7 +52,6 @@ jobs:
 
       # run_report 現在會同時抓大盤籌碼（三大法人、量能、融資融券、期貨、千張大戶）
       - name: Generate Excel/PDF + market data (DAYS=5)
-        continue-on-error: true
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -49,7 +59,6 @@ jobs:
 
       # v9 AI 分析：prompt 內含大盤籌碼 context
       - name: Gemini analysis (v9 + market context)
-        if: always()
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-2.5-pro"
@@ -64,7 +73,6 @@ jobs:
           python src/ai_analyze_gemini.py
 
       - name: Verify Gemini analysis (safe)
-        if: always()
         run: |
           python - <<'PY'
           import json
@@ -109,14 +117,12 @@ jobs:
           if-no-files-found: warn
 
       - name: Build mail subject
-        if: always()
         run: |
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           REPORT_DATE="$(TZ=Asia/Taipei date +'%Y-%m-%d')"
           echo "MAIL_SUBJECT=【外資半量化交易訊號系統分析】${REPORT_DATE}（TW 18:00）${REPO_NAME}" >> $GITHUB_ENV
 
-      - name: Send email (always)
-        if: always()
+      - name: Send email
         env:
           SMTP_HOST: "smtp.gmail.com"
           SMTP_PORT: "587"
@@ -133,7 +139,6 @@ jobs:
       # [skip ci] 避免此 push 再次觸發 workflow（防止無限迴圈）
       # git diff --staged --quiet 防呆：若無新資料（例如假日）則跳過，不產生空 commit
       - name: Commit historical signals DB
-        if: always()
         run: |
           git config --local user.name  "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
@@ -141,6 +146,7 @@ jobs:
           git diff --staged --quiet || (
             REPORT_DATE="$(TZ=Asia/Taipei date +'%Y-%m-%d')"
             git commit -m "📊 歷史訊號DB：${REPORT_DATE} 自動更新 [skip ci]"
+            git pull --rebase
             git push
             echo "[OK] historical_signals.csv 已 commit 回 repo"
           )
