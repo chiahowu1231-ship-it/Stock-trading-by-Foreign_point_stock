@@ -541,16 +541,22 @@ def fetch_margin_history(days: int = 6) -> list:
 
 def fetch_futures_institutional(date_str: str) -> Optional[dict]:
     """
-    抓取期交所三大法人期貨（台指期）淨部位
-    TAIFEX futContractsDate 表格欄位結構（13 欄）：
-      [0]  身份別
-      [1]  多方-交易口數        [2]  多方-交易契約金額(千元)
-      [3]  空方-交易口數        [4]  空方-交易契約金額(千元)
-      [5]  多空淨額-交易口數    [6]  多空淨額-交易契約金額(千元)
-      [7]  多方-未平倉口數      [8]  多方-未平倉契約金額(千元)
-      [9]  空方-未平倉口數      [10] 空方-未平倉契約金額(千元)
-      [11] 多空淨額-未平倉口數  ← 我們要這個
-      [12] 多空淨額-未平倉契約金額(千元)
+    抓取期交所三大法人期貨（台指期）淨部位。
+
+    ── 根本 Bug 修正 ──────────────────────────────────────────────────────
+    TAIFEX futContractsDate 表格中，自營商有兩個子行：
+      「自行買賣」和「避險」，且 TAIFEX 用 rowspan 合併「自營商」字樣。
+
+    舊版問題（導致 dealer_net_oi = 0 的根本原因）：
+      1. 只看 tds[0] 判斷身份 → 「避險」行因 rowspan 導致 tds[0] 是數字，
+         "自營商" in name 永遠 False，該行被完全跳過
+      2. 固定用 vals[11] 取淨口數 → TAIFEX 若新增欄位，index 就錯位
+
+    修正策略：
+      1. 掃描所有 td 找身份關鍵字（不只看 tds[0]）
+      2. 動態從 <th> 欄位標頭反推「多空淨額-未平倉口數」的實際 index
+      3. 跨 rowspan 追蹤上一行的身份（last_identity）讓「避險」行繼承
+    ──────────────────────────────────────────────────────────────────────
     """
     url = "https://www.taifex.com.tw/cht/3/futContractsDate"
 
@@ -580,49 +586,85 @@ def fetch_futures_institutional(date_str: str) -> Optional[dict]:
             "dealer_net_oi": 0,
         }
 
-        # ⚠️ Bug fix: TAIFEX 自營商有兩行（自行買賣 + 避險），原本 if/elif 會互相覆蓋
-        # 改用累加器，確保兩行都加入 dealer_net_oi
-        dealer_acc = 0
+        dealer_acc  = 0
         has_foreign = has_trust = has_dealer = False
 
-        # 找到所有表格的 tr
         for table in soup.find_all("table"):
+            # ── 動態偵測「多空淨額-未平倉口數」的欄位 index ───────────────
+            # 比固定 vals[11] 更穩健：TAIFEX 加欄也不怕
+            oi_net_idx = 11   # 預設 fallback
+            ths = table.find_all("th")
+            if ths:
+                for i, th in enumerate(ths):
+                    txt = th.get_text(strip=True)
+                    if "未平倉" in txt and "淨額" in txt and "口數" in txt:
+                        oi_net_idx = i
+                        break
+
+            last_identity = ""   # 跨 rowspan 追蹤身份
+
             for tr in table.find_all("tr"):
                 tds = tr.find_all("td")
-                if len(tds) < 12:
+                if len(tds) < 6:    # 至少要有資料欄
                     continue
 
-                name = tds[0].get_text(strip=True)
                 vals = [td.get_text(strip=True) for td in tds]
 
-                # 多空淨額-未平倉口數 = index 11（固定位置）
-                net_oi = _safe_int(vals[11]) if len(vals) > 11 else 0
-                net_trade = _safe_int(vals[5]) if len(vals) > 5 else 0
+                # ── 偵測身份關鍵字（掃全部 td，不只看 tds[0]）─────────────
+                # 解決 rowspan 問題：第二子行的 tds[0] 是數字，非身份文字
+                raw_identity = ""
+                identity_col = -1
+                for ci, td in enumerate(tds):
+                    txt = td.get_text(strip=True)
+                    if any(k in txt for k in ["自營商", "投信", "外資及陸資", "外資自營"]):
+                        raw_identity = txt
+                        identity_col = ci
+                        break
 
-                # 驗證：口數通常在 -500,000 ~ +500,000 之間
+                # 若本行找不到身份，繼承上一行（rowspan 跨行）
+                if raw_identity:
+                    last_identity = raw_identity
+                    # 有身份欄時，淨口數向右偏移（身份欄佔了一格）
+                    data_start = identity_col + 1
+                else:
+                    # 無身份欄（避險子行）→ 繼承 last_identity，資料從 index 0 開始
+                    data_start = 0
+
+                # ── 動態取淨口數 ─────────────────────────────────────────
+                # oi_net_idx 是相對整行 th 的位置
+                # 若本行有身份欄，實際資料 index = oi_net_idx - data_start
+                adjusted_idx = oi_net_idx - data_start
+                if adjusted_idx < 0 or adjusted_idx >= len(vals):
+                    # fallback：直接用行末倒數第 2 欄（通常是淨口數）
+                    adjusted_idx = len(vals) - 2
+
+                net_oi = _safe_int(vals[adjusted_idx]) if adjusted_idx < len(vals) else 0
+
+                # 合理性驗證
                 if abs(net_oi) > 1_000_000:
-                    print(f"  [futures] ⚠ {name} net_oi={net_oi} 異常大，改用 net_trade={net_trade}")
-                    net_oi = net_trade
+                    net_oi = 0
 
-                if "外資" in name and "外資及陸資" in name:
-                    # 只取「外資及陸資」主行，排除子分類
+                identity = last_identity
+
+                # ── 分類累加 ─────────────────────────────────────────────
+                if "外資及陸資" in identity and "外資自營" not in identity:
                     if not has_foreign:
                         result["foreign_net_oi"] = net_oi
                         has_foreign = True
-                elif "外資" in name and not has_foreign:
-                    result["foreign_net_oi"] += net_oi
-                    has_foreign = True
-                elif "投信" in name:
-                    result["trust_net_oi"] = net_oi
-                    has_trust = True
-                elif "自營商" in name:
-                    # 自營商有兩子行（自行買賣 + 避險），需累加
+                elif "投信" in identity:
+                    if not has_trust:
+                        result["trust_net_oi"] = net_oi
+                        has_trust = True
+                elif "自營商" in identity:
+                    # 累加：自行買賣 + 避險（兩行都計入）
                     dealer_acc += net_oi
                     has_dealer = True
 
         result["dealer_net_oi"] = dealer_acc
 
         if has_foreign or has_trust or has_dealer:
+            print(f"  [futures] {date_str} 外資={result['foreign_net_oi']:,} "
+                  f"投信={result['trust_net_oi']:,} 自營={result['dealer_net_oi']:,}")
             return result
 
     except ImportError:
