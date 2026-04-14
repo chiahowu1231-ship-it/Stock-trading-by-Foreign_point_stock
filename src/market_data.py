@@ -590,17 +590,6 @@ def fetch_futures_institutional(date_str: str) -> Optional[dict]:
         has_foreign = has_trust = has_dealer = False
 
         for table in soup.find_all("table"):
-            # ── 動態偵測「多空淨額-未平倉口數」的欄位 index ───────────────
-            # 比固定 vals[11] 更穩健：TAIFEX 加欄也不怕
-            oi_net_idx = 11   # 預設 fallback
-            ths = table.find_all("th")
-            if ths:
-                for i, th in enumerate(ths):
-                    txt = th.get_text(strip=True)
-                    if "未平倉" in txt and "淨額" in txt and "口數" in txt:
-                        oi_net_idx = i
-                        break
-
             last_identity = ""   # 跨 rowspan 追蹤身份
 
             for tr in table.find_all("tr"):
@@ -610,37 +599,32 @@ def fetch_futures_institutional(date_str: str) -> Optional[dict]:
 
                 vals = [td.get_text(strip=True) for td in tds]
 
-                # ── 偵測身份關鍵字（掃全部 td，不只看 tds[0]）─────────────
-                # 解決 rowspan 問題：第二子行的 tds[0] 是數字，非身份文字
+                # ── 偵測身份關鍵字（掃全部 td，解決 rowspan 問題）──────────
                 raw_identity = ""
-                identity_col = -1
-                for ci, td in enumerate(tds):
+                has_id_col = False
+                for td in tds:
                     txt = td.get_text(strip=True)
                     if any(k in txt for k in ["自營商", "投信", "外資及陸資", "外資自營"]):
                         raw_identity = txt
-                        identity_col = ci
+                        has_id_col = True
                         break
 
-                # 若本行找不到身份，繼承上一行（rowspan 跨行）
-                if raw_identity:
+                # ── 固定 Index 判斷（最簡單直白，不做減法偏移）────────────
+                # 有身份欄（外資/投信/自營商-自行買賣）：列長度=13，淨口數固定 index 11
+                # 無身份欄（自營商-避險子行，rowspan 吃掉第1欄）：列長度=12，index 前移 → 10
+                if has_id_col:
                     last_identity = raw_identity
-                    # 有身份欄時，淨口數向右偏移（身份欄佔了一格）
-                    data_start = identity_col + 1
+                    adjusted_idx = 11
                 else:
-                    # 無身份欄（避險子行）→ 繼承 last_identity，資料從 index 0 開始
-                    data_start = 0
+                    adjusted_idx = 10
 
-                # ── 動態取淨口數 ─────────────────────────────────────────
-                # oi_net_idx 是相對整行 th 的位置
-                # 若本行有身份欄，實際資料 index = oi_net_idx - data_start
-                adjusted_idx = oi_net_idx - data_start
-                if adjusted_idx < 0 or adjusted_idx >= len(vals):
-                    # fallback：直接用行末倒數第 2 欄（通常是淨口數）
+                # 邊界防呆
+                if adjusted_idx >= len(vals):
                     adjusted_idx = len(vals) - 2
 
                 net_oi = _safe_int(vals[adjusted_idx]) if adjusted_idx < len(vals) else 0
 
-                # 合理性驗證
+                # 合理性驗證：契約金額（千元）動輒百萬，若誤抓到則歸零
                 if abs(net_oi) > 1_000_000:
                     net_oi = 0
 
