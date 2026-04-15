@@ -1,8 +1,8 @@
-name: 半量化交易訊號系統 (TW 18:00)
+name: 半量化交易訊號系統 (TW 19:50)
 
 on:
   schedule:
-    - cron: "50 11 * * 1-5"   # 台灣時間 19:50（TWSE 完整版 19:40 產製後）
+    - cron: "0 10 * * 1-5"
   workflow_dispatch: {}
 
 # 賦予 git push 權限（historical_signals.csv 每日自動 commit 回 repo）
