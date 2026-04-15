@@ -20,6 +20,11 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Taipei")
 
+# ── 手機友善設定 ──────────────────────────────────────────────────────────────
+# Email 表格顯示天數：預設 3 日，手機不會太長。可在 daily_report.yml env 設定
+# EMAIL_TABLE_DAYS=6 恢復完整顯示
+EMAIL_TABLE_DAYS = int(os.getenv("EMAIL_TABLE_DAYS", "3"))
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  通用工具函式
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -181,20 +186,54 @@ def _sec_hdr(icon: str, title: str, color_key: str = "blue", subtitle: str = "")
     )
 
 
+def _render_kpi_inst(inst: list) -> str:
+    """手機友善 KPI 摘要卡片：只取最新一日三大法人數字。"""
+    if not inst:
+        return ""
+    d0  = inst[0]
+    fg  = (d0.get("foreign") or {}).get("net", 0)
+    tr  = (d0.get("trust")   or {}).get("net", 0)
+    dl  = (d0.get("dealer")  or {}).get("net", 0)
+    tot = d0.get("total_net", fg + tr + dl)
+    date_lbl = _fmt_date(d0.get("date", ""))
+
+    def _card(title, val):
+        c = _color(val)
+        sign = "▲" if val > 0 else ("▼" if val < 0 else "")
+        return (
+            '<td style="padding:8px 6px;text-align:center;'
+            'border:1px solid #D5D8DC;background:#F8FAFC;">'
+            f'<div style="font-size:11px;color:#6B7280;">{_esc(title)}</div>'
+            f'<div style="font-size:15px;font-weight:800;color:{c};">'
+            f'{sign}{_fb(val)}</div></td>'
+        )
+
+    return (
+        f'<div style="margin:10px 0 4px;font-size:13px;font-weight:700;color:#1F2D3D;">'
+        f'📌 今日三大法人摘要（{date_lbl}）</div>'
+        '<div style="font-size:11px;color:#888;margin-bottom:6px;">'
+        '手機版先看重點，完整多日明細在下方表格與附件。</div>'
+        '<table style="width:100%;border-collapse:separate;border-spacing:4px;">'
+        f'<tr>{_card("外資",fg)}{_card("投信",tr)}{_card("自營",dl)}{_card("合計",tot)}</tr>'
+        '</table>'
+    )
+
+
 def _table_open(col_styles: list = None) -> str:
-    """開啟專業表格，可選 colgroup 寬度。col_styles = [("60px",""), ("auto",""), ...]"""
+    """開啟表格，外層加 overflow-x:auto div 讓手機端可橫向滑動。"""
     cols = ""
     if col_styles:
         cols = "<colgroup>" + "".join(
             f'<col style="width:{w};{s}">' for w, s in col_styles
         ) + "</colgroup>"
     return (
+        '<div style="width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;">'
         f'<table style="width:100%;border-collapse:collapse;font-size:12.5px;'
         f'border:1px solid #D5D8DC;border-top:none;margin-bottom:0;">{cols}'
     )
 
 
-TABLE_CLOSE = "</table>"
+TABLE_CLOSE = "</table></div>"
 
 
 def _th_row(*cols, bg: str = "#2C3E50", color: str = "#FFFFFF") -> str:
@@ -283,56 +322,15 @@ def _render_taiex(taiex: list) -> str:
     return hdr + tbl
 
 
-def _validate_institutional(inst: list) -> list:
-    """
-    驗證三大法人資料品質，回傳警示訊息清單（空清單=正常）。
-    用於在 Email 顯示黃色警示條，讓你一眼看出資料源或查詢參數是否出問題。
-    """
-    warns = []
-    if not inst:
-        warns.append("三大法人資料為空，可能 TWSE API 查詢失敗或今日非交易日")
-        return warns
-
-    # 檢查日期重複（最嚴重的症狀：6天全相同 = dayDate 參數失效）
-    dates = [x.get("date") for x in inst if x.get("date")]
-    if len(dates) != len(set(dates)):
-        warns.append("⚠️ 三大法人歷史日期有重複，dayDate 查詢參數可能失效")
-
-    # 檢查數值完全相同（6筆 net 相同幾乎不可能在真實市場出現）
-    if len(inst) > 1:
-        nets = tuple(
-            (x.get("foreign", {}).get("net", 0),
-             x.get("trust",   {}).get("net", 0),
-             x.get("dealer",  {}).get("net", 0))
-            for x in inst
-        )
-        if len(set(nets)) == 1:
-            warns.append("⚠️ 近多日三大法人數值完全相同（可能 API 持續回傳最新單日資料）")
-
-    return warns
-
-
 def _render_institutional(inst: list) -> str:
     if not inst:
         return ""
-
-    # ── 資料品質驗證（產生警示條）─────────────────────────────────────────
-    warns = _validate_institutional(inst)
-    warn_html = ""
-    if warns:
-        warn_items = "；".join(warns)
-        warn_html = (
-            '<div style="margin:4px 0;padding:6px 12px;background:#FFF3CD;'
-            'border-left:4px solid #F39C12;font-size:11px;color:#7D4000;">'
-            f'⚠️ 資料異常偵測：{warn_items}</div>'
-        )
-
     n = len(inst[:6])
     # 累計加總
-    cum_fg  = sum(d["foreign"]["net"]   for d in inst[:6])
-    cum_tr  = sum(d["trust"]["net"]     for d in inst[:6])
-    cum_dl  = sum(d["dealer"]["net"]    for d in inst[:6])
-    cum_tot = sum(d.get("total_net", 0) for d in inst[:6])
+    cum_fg  = sum(d["foreign"]["net"]   for d in inst[:EMAIL_TABLE_DAYS])
+    cum_tr  = sum(d["trust"]["net"]     for d in inst[:EMAIL_TABLE_DAYS])
+    cum_dl  = sum(d["dealer"]["net"]    for d in inst[:EMAIL_TABLE_DAYS])
+    cum_tot = sum(d.get("total_net", 0) for d in inst[:EMAIL_TABLE_DAYS])
     date_start = _fmt_date(inst[min(n-1, 5)]["date"])
     date_end   = _fmt_date(inst[0]["date"])
 
@@ -354,7 +352,7 @@ def _render_institutional(inst: list) -> str:
         ("自營買賣超", "right"), ("三大合計", "right"),
         bg="#1F618D",
     )
-    for i, d in enumerate(inst[:6]):
+    for i, d in enumerate(inst[:EMAIL_TABLE_DAYS]):
         fg  = d["foreign"]["net"]
         tr  = d["trust"]["net"]
         dl  = d["dealer"]["net"]
@@ -412,7 +410,8 @@ def _render_institutional(inst: list) -> str:
         f'外資&nbsp;{fg_badge}&nbsp;&nbsp;投信&nbsp;{tr_badge}&nbsp;&nbsp;自營&nbsp;{dl_badge}'
         f'</td></tr>'
     )
-    return warn_html + hdr + tbl
+    tbl += TABLE_CLOSE
+    return hdr + tbl
 
 
 def _render_margin(margin: list) -> str:
@@ -430,7 +429,7 @@ def _render_margin(margin: list) -> str:
         ("券資比", "right"),
         bg="#515A5A",
     )
-    for i, d in enumerate(margin[:6]):
+    for i, d in enumerate(margin[:EMAIL_TABLE_DAYS]):
         mc = d.get("margin_change", 0)
         mb = d.get("margin_balance", 0)
         sc = d.get("short_change", 0)
@@ -479,7 +478,7 @@ def _render_futures(futures: list) -> str:
         ("外資淨口數", "right"), ("投信淨口數", "right"), ("自營淨口數", "right"),
         bg="#6C3483",
     )
-    for i, d in enumerate(futures[:6]):
+    for i, d in enumerate(futures[:EMAIL_TABLE_DAYS]):
         fg = d.get("foreign_net_oi", 0)
         tr = d.get("trust_net_oi", 0)
         dl = d.get("dealer_net_oi", 0)
@@ -931,6 +930,20 @@ def build_html(summary: dict) -> str:
     futures = market.get("futures") or []
     tdcc    = market.get("tdcc") or []
 
+    # ── 手機友善：KPI 摘要卡片 + 資料異常警示（置頂顯示）────────────────────
+    if inst:
+        p.append(_render_kpi_inst(inst))
+        warns = _validate_institutional(inst)
+        if warns:
+            items = "".join(f"<li>{_esc(w)}</li>" for w in warns[:4])
+            p.append(
+                '<div style="margin:8px 0;background:#FFFBEB;border:1px solid #F59E0B;'
+                'border-radius:8px;padding:10px 12px;">'
+                '<div style="font-weight:800;color:#92400E;">⚠️ 資料異常偵測</div>'
+                f'<ul style="margin:4px 0 0 16px;color:#92400E;line-height:1.6;">{items}</ul>'
+                '</div>'
+            )
+
     has_market = any([taiex, inst, margin, futures])
     if has_market:
         p.append(
@@ -1165,19 +1178,32 @@ def build_html(summary: dict) -> str:
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         '<style>'
+        # 基礎重置
+        'body{margin:0;padding:0;background:#DDE4EC;}'
         'table{border-spacing:0!important;}'
         'td,th{border-spacing:0!important;}'
         'a{color:#2E86C1;}'
-        '@media(max-width:600px){'
-        '.wrap{padding:10px!important;}'
-        'table{font-size:11px!important;}'
+        # 表格字體、行距
+        'td,th{font-size:13px;line-height:1.5;}'
+        # 手機：外框收窄，表格字縮小
+        '@media only screen and (max-width:520px){'
+        '.wrap{padding:8px!important;}'
+        'td,th{font-size:11px!important;}'
+        'h1{font-size:18px!important;}'
         '}'
         '</style></head>'
-        '<body style="margin:0;padding:16px;background:#DDE4EC;'
-        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;\">"
-        '<div class="wrap" style="max-width:700px;margin:0 auto;background:#FFF;'
-        'border-radius:8px;overflow:hidden;box-shadow:0 3px 12px rgba(0,0,0,0.15);">'
-        f'{body}</div></body></html>'
+        '<body style="margin:0;padding:14px 10px;background:#DDE4EC;'
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,"
+        "'Noto Sans TC','PingFang TC','Microsoft JhengHei',sans-serif;\">"
+        '<div class="wrap" style="max-width:680px;margin:0 auto;background:#FFF;'
+        'border-radius:10px;overflow:hidden;box-shadow:0 3px 12px rgba(0,0,0,0.15);">'
+        f'{body}'
+        '</div>'
+        '<div style="max-width:680px;margin:10px auto 0;font-size:11px;'
+        'color:#888;text-align:center;">'
+        '📎 手機版建議先看「今日重點摘要」與「AI 分析摘要」；完整明細請開附件 PDF / Excel。'
+        '</div>'
+        '</body></html>'
     )
 
 
@@ -1573,7 +1599,7 @@ def build_analysis_pdf(summary: dict, pdf_path: str):
         hdr = [p(t, fontName=FNB, fontSize=8, textColor=C["white"]) for t in
                ["日期","外資買賣超","投信買賣超","自營買賣超","三大合計"]]
         rows = [hdr]
-        for i, d in enumerate(inst[:6]):
+        for i, d in enumerate(inst[:EMAIL_TABLE_DAYS]):
             fg  = d["foreign"]["net"]
             tr  = d["trust"]["net"]
             dl  = d["dealer"]["net"]
@@ -1600,7 +1626,7 @@ def build_analysis_pdf(summary: dict, pdf_path: str):
         hdr = [p(t, fontName=FNB, fontSize=8, textColor=C["white"]) for t in
                ["日期","外資淨口數","投信淨口數","自營淨口數"]]
         rows = [hdr]
-        for i, d in enumerate(futures[:6]):
+        for i, d in enumerate(futures[:EMAIL_TABLE_DAYS]):
             fg = d.get("foreign_net_oi", 0)
             tr = d.get("trust_net_oi", 0)
             dl = d.get("dealer_net_oi", 0)
