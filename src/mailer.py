@@ -283,9 +283,50 @@ def _render_taiex(taiex: list) -> str:
     return hdr + tbl
 
 
+def _validate_institutional(inst: list) -> list:
+    """
+    驗證三大法人資料品質，回傳警示訊息清單（空清單=正常）。
+    用於在 Email 顯示黃色警示條，讓你一眼看出資料源或查詢參數是否出問題。
+    """
+    warns = []
+    if not inst:
+        warns.append("三大法人資料為空，可能 TWSE API 查詢失敗或今日非交易日")
+        return warns
+
+    # 檢查日期重複（最嚴重的症狀：6天全相同 = dayDate 參數失效）
+    dates = [x.get("date") for x in inst if x.get("date")]
+    if len(dates) != len(set(dates)):
+        warns.append("⚠️ 三大法人歷史日期有重複，dayDate 查詢參數可能失效")
+
+    # 檢查數值完全相同（6筆 net 相同幾乎不可能在真實市場出現）
+    if len(inst) > 1:
+        nets = tuple(
+            (x.get("foreign", {}).get("net", 0),
+             x.get("trust",   {}).get("net", 0),
+             x.get("dealer",  {}).get("net", 0))
+            for x in inst
+        )
+        if len(set(nets)) == 1:
+            warns.append("⚠️ 近多日三大法人數值完全相同（可能 API 持續回傳最新單日資料）")
+
+    return warns
+
+
 def _render_institutional(inst: list) -> str:
     if not inst:
         return ""
+
+    # ── 資料品質驗證（產生警示條）─────────────────────────────────────────
+    warns = _validate_institutional(inst)
+    warn_html = ""
+    if warns:
+        warn_items = "；".join(warns)
+        warn_html = (
+            '<div style="margin:4px 0;padding:6px 12px;background:#FFF3CD;'
+            'border-left:4px solid #F39C12;font-size:11px;color:#7D4000;">'
+            f'⚠️ 資料異常偵測：{warn_items}</div>'
+        )
+
     n = len(inst[:6])
     # 累計加總
     cum_fg  = sum(d["foreign"]["net"]   for d in inst[:6])
@@ -371,8 +412,7 @@ def _render_institutional(inst: list) -> str:
         f'外資&nbsp;{fg_badge}&nbsp;&nbsp;投信&nbsp;{tr_badge}&nbsp;&nbsp;自營&nbsp;{dl_badge}'
         f'</td></tr>'
     )
-    tbl += TABLE_CLOSE
-    return hdr + tbl
+    return warn_html + hdr + tbl
 
 
 def _render_margin(margin: list) -> str:
