@@ -20,9 +20,8 @@ from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Taipei")
 
-# ── 手機友善設定 ──────────────────────────────────────────────────────────────
-# Email 表格顯示天數：預設 3 日，手機不會太長。可在 daily_report.yml env 設定
-# EMAIL_TABLE_DAYS=6 恢復完整顯示
+# Email 表格顯示天數：預設 3 日，手機不會太長
+# 在 daily_report.yml env 加 EMAIL_TABLE_DAYS: "6" 可恢復完整顯示
 EMAIL_TABLE_DAYS = int(os.getenv("EMAIL_TABLE_DAYS", "3"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -186,41 +185,8 @@ def _sec_hdr(icon: str, title: str, color_key: str = "blue", subtitle: str = "")
     )
 
 
-def _render_kpi_inst(inst: list) -> str:
-    """手機友善 KPI 摘要卡片：只取最新一日三大法人數字。"""
-    if not inst:
-        return ""
-    d0  = inst[0]
-    fg  = (d0.get("foreign") or {}).get("net", 0)
-    tr  = (d0.get("trust")   or {}).get("net", 0)
-    dl  = (d0.get("dealer")  or {}).get("net", 0)
-    tot = d0.get("total_net", fg + tr + dl)
-    date_lbl = _fmt_date(d0.get("date", ""))
-
-    def _card(title, val):
-        c = _color(val)
-        sign = "▲" if val > 0 else ("▼" if val < 0 else "")
-        return (
-            '<td style="padding:8px 6px;text-align:center;'
-            'border:1px solid #D5D8DC;background:#F8FAFC;">'
-            f'<div style="font-size:11px;color:#6B7280;">{_esc(title)}</div>'
-            f'<div style="font-size:15px;font-weight:800;color:{c};">'
-            f'{sign}{_fb(val)}</div></td>'
-        )
-
-    return (
-        f'<div style="margin:10px 0 4px;font-size:13px;font-weight:700;color:#1F2D3D;">'
-        f'📌 今日三大法人摘要（{date_lbl}）</div>'
-        '<div style="font-size:11px;color:#888;margin-bottom:6px;">'
-        '手機版先看重點，完整多日明細在下方表格與附件。</div>'
-        '<table style="width:100%;border-collapse:separate;border-spacing:4px;">'
-        f'<tr>{_card("外資",fg)}{_card("投信",tr)}{_card("自營",dl)}{_card("合計",tot)}</tr>'
-        '</table>'
-    )
-
-
 def _table_open(col_styles: list = None) -> str:
-    """開啟表格，外層加 overflow-x:auto div 讓手機端可橫向滑動。"""
+    """開啟表格，外層加 overflow-x:auto 讓手機端可橫向滑動。"""
     cols = ""
     if col_styles:
         cols = "<colgroup>" + "".join(
@@ -320,6 +286,69 @@ def _render_taiex(taiex: list) -> str:
         )
     tbl += TABLE_CLOSE
     return hdr + tbl
+
+
+def _validate_institutional(inst: list) -> list:
+    """
+    驗證三大法人資料品質，回傳警示訊息清單（空清單=正常）。
+    用於在 Email 頂部顯示黃色警示條，讓你一眼識別資料異常。
+    """
+    if not inst:
+        return ["三大法人資料為空，可能 TWSE API 查詢失敗或今日非交易日"]
+
+    # 日期重複（最嚴重：dayDate 失效時6天全部相同日期）
+    dates = [x.get("date") for x in inst if x.get("date")]
+    if len(dates) != len(set(dates)):
+        return ["⚠️ 三大法人歷史日期有重複，dayDate 查詢參數可能失效，數值不可信"]
+
+    # 數值完全相同（正常市場幾乎不可能出現）
+    if len(inst) > 1:
+        nets = tuple(
+            (x.get("foreign", {}).get("net", 0),
+             x.get("trust",   {}).get("net", 0),
+             x.get("dealer",  {}).get("net", 0))
+            for x in inst
+        )
+        if len(set(nets)) == 1:
+            return ["⚠️ 近多日三大法人數值完全相同，疑似 API 持續回傳最新單日資料"]
+
+    return []
+
+
+def _render_kpi_inst(inst: list) -> str:
+    """
+    手機友善 KPI 摘要卡片（4格）：只取最新一日三大法人數字。
+    置頂顯示，讓手機使用者不需滾動表格就能看到今日重點。
+    """
+    if not inst:
+        return ""
+    d0  = inst[0]
+    fg  = (d0.get("foreign") or {}).get("net", 0)
+    tr  = (d0.get("trust")   or {}).get("net", 0)
+    dl  = (d0.get("dealer")  or {}).get("net", 0)
+    tot = d0.get("total_net", fg + tr + dl)
+    date_lbl = _fmt_date(d0.get("date", ""))
+
+    def _card(title, val):
+        c = _color(val)
+        arrow = "▲" if val > 0 else ("▼" if val < 0 else "")
+        return (
+            f'<td style="padding:8px 6px;text-align:center;border:1px solid #D5D8DC;'
+            f'border-radius:6px;background:#F8FAFC;">'
+            f'<div style="font-size:11px;color:#6B7280;">{_esc(title)}</div>'
+            f'<div style="font-size:15px;font-weight:800;color:{c};">'
+            f'{arrow}{_fb(val)}</div></td>'
+        )
+
+    return (
+        f'<div style="margin:10px 0 4px;font-size:13px;font-weight:700;color:#1F2D3D;">'
+        f'📌 今日三大法人摘要（{date_lbl}）</div>'
+        '<div style="font-size:11px;color:#888;margin-bottom:6px;">'
+        '手機版先看重點摘要，完整多日明細在下方表格，詳細報告請開附件 PDF。</div>'
+        '<table style="width:100%;border-collapse:separate;border-spacing:4px;">'
+        f'<tr>{_card("外資",fg)}{_card("投信",tr)}{_card("自營",dl)}{_card("合計",tot)}</tr>'
+        '</table>'
+    )
 
 
 def _render_institutional(inst: list) -> str:
@@ -1178,14 +1207,9 @@ def build_html(summary: dict) -> str:
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         '<style>'
-        # 基礎重置
-        'body{margin:0;padding:0;background:#DDE4EC;}'
         'table{border-spacing:0!important;}'
-        'td,th{border-spacing:0!important;}'
+        'td,th{border-spacing:0!important;font-size:13px;line-height:1.5;}'
         'a{color:#2E86C1;}'
-        # 表格字體、行距
-        'td,th{font-size:13px;line-height:1.5;}'
-        # 手機：外框收窄，表格字縮小
         '@media only screen and (max-width:520px){'
         '.wrap{padding:8px!important;}'
         'td,th{font-size:11px!important;}'
@@ -1200,8 +1224,8 @@ def build_html(summary: dict) -> str:
         f'{body}'
         '</div>'
         '<div style="max-width:680px;margin:10px auto 0;font-size:11px;'
-        'color:#888;text-align:center;">'
-        '📎 手機版建議先看「今日重點摘要」與「AI 分析摘要」；完整明細請開附件 PDF / Excel。'
+        'color:#888;text-align:center;line-height:1.8;">'
+        '📎 手機版建議先看「今日重點摘要」與「AI 分析」；完整明細請開附件 PDF / Excel。'
         '</div>'
         '</body></html>'
     )
