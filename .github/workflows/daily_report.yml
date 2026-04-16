@@ -2,7 +2,7 @@ name: 半量化交易訊號系統 (TW 19:50)
 
 on:
   schedule:
-    - cron: "0 10 * * 1-5"
+    - cron: "50 11 * * 1-5"   # 台灣時間 19:50（TWSE 完整版 19:40 後）
   workflow_dispatch: {}
 
 # 賦予 git push 權限（historical_signals.csv 每日自動 commit 回 repo）
@@ -37,10 +37,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: 'pip'            # 自動快取 requirements.txt，省下每次安裝的 30 秒
@@ -103,7 +103,7 @@ jobs:
 
       - name: Upload artifacts (auto expire)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: foreign-report
           path: |
