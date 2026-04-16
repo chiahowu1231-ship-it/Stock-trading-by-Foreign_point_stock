@@ -61,36 +61,40 @@ def _safe_float(s) -> float:
 
 
 def _get_json(url: str, params: dict = None, retries: int = 3, timeout: int = 15) -> Optional[dict]:
-    """帶重試的 JSON GET（對 TWSE 回傳格式寬容）"""
+    """帶重試的 JSON GET（對 TWSE 回傳格式寬容）。所有失敗都印出 url/params/status/exception。"""
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
             if r.status_code == 200:
                 data = r.json()
-                # TWSE 回傳可能是 {"stat":"OK","data":[...]} 或直接 {"data":[...]} 或 [...]
                 if isinstance(data, list):
                     return {"data": data}
                 if isinstance(data, dict):
-                    # 有任何 key 包含 data/list/array 就回傳
                     return data
-            print(f"  [market_data] {url} HTTP {r.status_code}")
+            # 非 200：印出完整診斷資訊
+            print(f"  [_get_json] HTTP {r.status_code} | url={url} | params={params}")
         except Exception as e:
-            print(f"  [market_data] {url} attempt {attempt+1} failed: {e}")
+            print(f"  [_get_json] attempt {attempt+1}/{retries} failed"
+                  f" | url={url} | params={params} | {type(e).__name__}: {e}")
         time.sleep(1.0 + random.uniform(0, 0.5))
+    print(f"  [_get_json] 全部 {retries} 次重試失敗 | url={url} | params={params}")
     return None
 
 
 def _get_html(url: str, params: dict = None, retries: int = 3, timeout: int = 15) -> Optional[str]:
-    """帶重試的 HTML GET"""
+    """帶重試的 HTML GET。所有失敗都印出 url/params/exception。"""
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
             r.encoding = "utf-8"
             if r.status_code == 200 and r.text:
                 return r.text
+            print(f"  [_get_html] HTTP {r.status_code} | url={url} | params={params}")
         except Exception as e:
-            print(f"  [market_data] HTML {url} attempt {attempt+1}: {e}")
+            print(f"  [_get_html] attempt {attempt+1}/{retries} failed"
+                  f" | url={url} | params={params} | {type(e).__name__}: {e}")
         time.sleep(1.0 + random.uniform(0, 0.5))
+    print(f"  [_get_html] 全部 {retries} 次重試失敗 | url={url} | params={params}")
     return None
 
 
@@ -98,113 +102,174 @@ def _get_html(url: str, params: dict = None, retries: int = 3, timeout: int = 15
 #  1. 三大法人買賣超
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def fetch_institutional_trading(date_str: str) -> Optional[dict]:
+def _parse_bfi82u_rows(data_rows: list, date_str: str) -> Optional[dict]:
     """
-    抓取三大法人買賣超（TWSE BFI82U）
-    date_str: 'YYYYMMDD'
+    BFI82U JSON data rows → 單日三大法人 dict。
 
-    TWSE BFI82U 實際欄位名稱（無「合計」行時的結構）：
-      row 0: 自營商(自行買賣)
-      row 1: 自營商(避險)
-      row 2: 投信
-      row 3: 外資及陸資(不含外資自營商)
-      row 4: 外資自營商
-      row 5: 合計（= 三大法人合計）
-    有時會有「自營商合計」「外資及陸資合計」等合計行。
+    使用 rows_by_name mapping（比固定 index 更穩定）：
+      先把每一行的 name → (buy, sell, net) 建成 dict，
+      再依業務邏輯累加外資/投信/自營商。
+    最後做 official total vs calc_total sanity check 並印出診斷。
     """
-    # ⚠️ Bug fix: TWSE BFI82U 正確參數是 "date"，不是 "dayDate"
-    url = "https://www.twse.com.tw/exchangeReport/BFI82U"
-    data = _get_json(url, params={"response": "json", "date": date_str})
-    if not data or not data.get("data"):
-        return None
-
-    result = {
-        "date": date_str,
-        "foreign": {"buy": 0, "sell": 0, "net": 0},
-        "trust": {"buy": 0, "sell": 0, "net": 0},
-        "dealer": {"buy": 0, "sell": 0, "net": 0},
-        "total_net": 0,
-    }
-
-    # 累加器（外資和自營商各有 2 個子行需要加總）
-    foreign_buy, foreign_sell, foreign_net = 0, 0, 0
-    dealer_buy, dealer_sell, dealer_net = 0, 0, 0
-    has_foreign_total = False
-    has_dealer_total = False
-
-    for row in data["data"]:
+    # 1. 建立 name → (buy, sell, net) mapping
+    rows_by_name: dict = {}
+    for row in data_rows:
         if len(row) < 4:
             continue
         name = str(row[0]).strip()
         b, s, n = _safe_int(row[1]), _safe_int(row[2]), _safe_int(row[3])
+        rows_by_name[name] = (b, s, n)
 
-        # ── 外資 ──
-        # 如果有「外資及陸資合計」直接用它
+    if not rows_by_name:
+        return None
+
+    # 2. 依名稱累加各法人
+    foreign_buy = foreign_sell = foreign_net = 0
+    dealer_buy  = dealer_sell  = dealer_net  = 0
+    trust_net = official_total = 0
+    has_foreign_total = has_dealer_total = False
+
+    for name, (b, s, n) in rows_by_name.items():
         if "外資" in name and "合計" in name:
-            result["foreign"] = {"buy": b, "sell": s, "net": n}
+            foreign_buy, foreign_sell, foreign_net = b, s, n
             has_foreign_total = True
-        # 否則累加「外資及陸資(不含外資自營商)」+「外資自營商」
-        elif "外資" in name:
-            foreign_buy += b
-            foreign_sell += s
-            foreign_net += n
-
-        # ── 投信 ──
-        elif "投信" in name:
-            result["trust"] = {"buy": b, "sell": s, "net": n}
-
-        # ── 自營商 ──
+        elif "外資" in name and not has_foreign_total:
+            foreign_buy += b; foreign_sell += s; foreign_net += n
+        elif "投信" in name and "合計" not in name:
+            trust_net = n
         elif "自營商" in name and "合計" in name:
-            result["dealer"] = {"buy": b, "sell": s, "net": n}
+            dealer_buy, dealer_sell, dealer_net = b, s, n
             has_dealer_total = True
-        elif "自營商" in name:
-            dealer_buy += b
-            dealer_sell += s
-            dealer_net += n
+        elif "自營商" in name and not has_dealer_total:
+            dealer_buy += b; dealer_sell += s; dealer_net += n
+        elif name == "合計" or "三大法人" in name:
+            official_total = n
 
-        # ── 三大法人合計（最後一行通常是「合計」）──
-        elif ("三大法人" in name) or (name == "合計"):
-            result["total_net"] = n
+    calc_total = foreign_net + trust_net + dealer_net
+    if official_total == 0:
+        official_total = calc_total
 
-    # 如果沒有找到合計行，用累加值
-    if not has_foreign_total and (foreign_buy or foreign_sell or foreign_net):
-        result["foreign"] = {"buy": foreign_buy, "sell": foreign_sell, "net": foreign_net}
-    if not has_dealer_total and (dealer_buy or dealer_sell or dealer_net):
-        result["dealer"] = {"buy": dealer_buy, "sell": dealer_sell, "net": dealer_net}
+    # 3. Sanity check：官方合計 vs 計算合計（允許小誤差）
+    if official_total != 0 and abs(official_total - calc_total) > abs(official_total) * 0.05:
+        print(f"  [parse_bfi82u] {date_str} ⚠️ 合計不吻合 "
+              f"official={official_total:,} calc={calc_total:,}，使用計算值")
 
-    # 如果 total_net 仍為 0，手動加總
-    if result["total_net"] == 0:
-        result["total_net"] = (
-            result["foreign"]["net"] + result["trust"]["net"] + result["dealer"]["net"]
-        )
+    if foreign_net == 0 and trust_net == 0 and dealer_net == 0:
+        print(f"  [parse_bfi82u] {date_str} 解析後三大法人均為零，回傳 None")
+        return None
 
-    return result
+    return {
+        "date": date_str,
+        "foreign": {"buy": foreign_buy, "sell": foreign_sell, "net": foreign_net},
+        "trust":   {"buy": 0, "sell": 0, "net": trust_net},
+        "dealer":  {"buy": dealer_buy,  "sell": dealer_sell,  "net": dealer_net},
+        "total_net": official_total,
+    }
+
+
+def fetch_institutional_trading(date_str: str) -> Optional[dict]:
+    """
+    抓取三大法人買賣超（TWSE BFI82U）。
+    date_str: 'YYYYMMDD'
+
+    ✅ 正確參數：dayDate=YYYYMMDD（TWSE 官方日資料查詢鍵）
+    ❌ 舊版 date= 只控制月份，每次都回最新一天 → 近6日全部相同
+    """
+    url  = "https://www.twse.com.tw/exchangeReport/BFI82U"
+    data = _get_json(url, params={"response": "json", "dayDate": date_str, "type": "day"})
+    if not data or not data.get("data"):
+        return None
+
+    # 驗證：API header date 必須與查詢日期一致（民國年轉西元）
+    actual = str(data.get("date", "")).replace("/", "")
+    if len(actual) == 7:
+        actual = f"{int(actual[:3]) + 1911}{actual[3:]}"
+    if actual and len(actual) == 8 and actual != date_str:
+        print(f"  [inst] 查詢 {date_str}，API 回傳 {actual}，日期不符跳過")
+        return None
+
+    return _parse_bfi82u_rows(data["data"], date_str)
 
 
 def fetch_institutional_history(days: int = 6) -> list:
-    """抓取近 N 天的三大法人買賣超"""
-    results = []
-    today = datetime.now(TZ)
+    """
+    抓取近 N 個交易日的三大法人買賣超（逐日真實數據）。
 
-    # 往前多抓幾天（跳過假日）
-    checked = 0
+    修正歷程：
+      舊版用 date= 參數，TWSE 只回最新一天 → 6次查詢拿到6份相同數據
+      新版用 dayDate=YYYYMMDD + 日期驗證 + 去重 + openapi 備援
+    """
+    results_map: dict = {}   # date_str → entry（去重 key）
+    today = datetime.now(TZ)
+    url   = "https://www.twse.com.tw/exchangeReport/BFI82U"
+
+    # ── Track A：dayDate 精確逐日查詢 ─────────────────────────────────────
     for delta in range(days * 2 + 5):
-        if len(results) >= days:
+        if len(results_map) >= days:
             break
         d = today - timedelta(days=delta)
-        if d.weekday() >= 5:  # 跳過六日
+        if d.weekday() >= 5:
             continue
         date_str = d.strftime("%Y%m%d")
-        print(f"  [institutional] 抓取 {date_str}...")
-        data = fetch_institutional_trading(date_str)
-        if data and any(
-            data[k]["net"] != 0 for k in ("foreign", "trust", "dealer")
-        ):
-            results.append(data)
-            print(f"    ✓ 外資={data['foreign']['net']:,} 投信={data['trust']['net']:,} 自營={data['dealer']['net']:,}")
+        if date_str in results_map:
+            continue
+        try:
+            data = _get_json(url, params={"response": "json", "dayDate": date_str, "type": "day"})
+            if not data or not data.get("data"):
+                print(f"  [inst-dayDate] {date_str} 無資料（假日/尚未更新）")
+                time.sleep(0.5)
+                continue
+
+            actual = str(data.get("date", "")).replace("/", "")
+            if len(actual) == 7:
+                actual = f"{int(actual[:3]) + 1911}{actual[3:]}"
+            if actual and len(actual) == 8 and actual != date_str:
+                print(f"  [inst-dayDate] 查 {date_str}，回傳 {actual}，跳過")
+                time.sleep(0.5)
+                continue
+
+            entry = _parse_bfi82u_rows(data["data"], date_str)
+            if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
+                results_map[date_str] = entry
+                print(f"  [inst-dayDate] ✓ {date_str} "
+                      f"外資={entry['foreign']['net']:,} "
+                      f"投信={entry['trust']['net']:,} "
+                      f"自營={entry['dealer']['net']:,}")
+            else:
+                print(f"  [inst-dayDate] {date_str} 解析結果全零，跳過")
+        except Exception as e:
+            print(f"  [inst-dayDate] {date_str} 例外: {e}")
         time.sleep(0.8 + random.uniform(0, 0.3))
 
-    return results
+    # ── Track B：openapi 今日即時補漏（19:40 更新前的時間窗口）─────────────
+    today_str = today.strftime("%Y%m%d")
+    if today_str not in results_map:
+        try:
+            resp = _get_json("https://openapi.twse.com.tw/v1/fund/BFI82U")
+            rows = resp if isinstance(resp, list) else (resp or {}).get("data", [])
+            if rows:
+                # openapi 格式轉換成統一格式
+                converted = [
+                    [r.get("SecuritiesTraderName", ""),
+                     r.get("Buy", "0"), r.get("Sell", "0"), r.get("Net", "0")]
+                    for r in rows if isinstance(r, dict)
+                ]
+                entry = _parse_bfi82u_rows(converted, today_str)
+                if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
+                    results_map[today_str] = entry
+                    print(f"  [inst-openapi] ✓ {today_str} "
+                          f"外資={entry['foreign']['net']:,} "
+                          f"投信={entry['trust']['net']:,} "
+                          f"自營={entry['dealer']['net']:,}")
+                else:
+                    print(f"  [inst-openapi] {today_str} 回傳全零")
+        except Exception as e:
+            print(f"  [inst-openapi] 例外: {e}")
+
+    if not results_map:
+        print("  [inst] ⚠️ 全部查詢失敗，institutional 為空")
+
+    return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -808,7 +873,32 @@ def fetch_all_market_data(top_stock_ids: list = None, history_days: int = 6) -> 
     try:
         print("\n[1/5] 三大法人買賣超...")
         result["institutional"] = fetch_institutional_history(history_days)
-        print(f"  ✓ 取得 {len(result['institutional'])} 天")
+        n_inst = len(result["institutional"])
+        print(f"  ✓ 取得 {n_inst} 天")
+        # 空結果也要記錄（silent failure 防呆）
+        if n_inst == 0:
+            result["fetch_errors"].append(
+                "institutional: empty result（TWSE dayDate API 無資料或時間窗口問題）"
+            )
+        else:
+            # Sanity check A：日期不應重複
+            dates = [x.get("date") for x in result["institutional"]]
+            if len(dates) != len(set(dates)):
+                result["fetch_errors"].append(
+                    "institutional: duplicate dates detected（dayDate 查詢失效，多日返回相同日期）"
+                )
+            # Sanity check B：連續多日數值完全相同（幾乎不可能在真實市場出現）
+            if n_inst >= 2:
+                sigs = tuple(
+                    (x.get("foreign",{}).get("net",0),
+                     x.get("trust",{}).get("net",0),
+                     x.get("dealer",{}).get("net",0))
+                    for x in result["institutional"]
+                )
+                if len(set(sigs)) == 1:
+                    result["fetch_errors"].append(
+                        "institutional: repeated identical daily values（疑似 API 持續回傳最新單日資料）"
+                    )
     except Exception as e:
         err = f"三大法人抓取失敗: {e}"
         print(f"  ✗ {err}")
@@ -818,7 +908,10 @@ def fetch_all_market_data(top_stock_ids: list = None, history_days: int = 6) -> 
     try:
         print("\n[2/5] 大盤指數 + 成交量...")
         result["taiex"] = fetch_taiex_daily(history_days)
-        print(f"  ✓ 取得 {len(result['taiex'])} 天")
+        n_taiex = len(result["taiex"])
+        print(f"  ✓ 取得 {n_taiex} 天")
+        if n_taiex == 0:
+            result["fetch_errors"].append("taiex: empty result")
     except Exception as e:
         err = f"大盤指數抓取失敗: {e}"
         print(f"  ✗ {err}")
@@ -828,7 +921,10 @@ def fetch_all_market_data(top_stock_ids: list = None, history_days: int = 6) -> 
     try:
         print("\n[3/5] 融資融券...")
         result["margin"] = fetch_margin_history(history_days)
-        print(f"  ✓ 取得 {len(result['margin'])} 天")
+        n_margin = len(result["margin"])
+        print(f"  ✓ 取得 {n_margin} 天")
+        if n_margin == 0:
+            result["fetch_errors"].append("margin: empty result")
     except Exception as e:
         err = f"融資融券抓取失敗: {e}"
         print(f"  ✗ {err}")
@@ -838,7 +934,10 @@ def fetch_all_market_data(top_stock_ids: list = None, history_days: int = 6) -> 
     try:
         print("\n[4/5] 期貨籌碼（三大法人台指期）...")
         result["futures"] = fetch_futures_history(history_days)
-        print(f"  ✓ 取得 {len(result['futures'])} 天")
+        n_futures = len(result["futures"])
+        print(f"  ✓ 取得 {n_futures} 天")
+        if n_futures == 0:
+            result["fetch_errors"].append("futures: empty result")
     except Exception as e:
         err = f"期貨籌碼抓取失敗: {e}"
         print(f"  ✗ {err}")
@@ -857,9 +956,20 @@ def fetch_all_market_data(top_stock_ids: list = None, history_days: int = 6) -> 
     else:
         print("\n[5/5] 千張大戶：無 top_stock_ids，跳過")
 
-    total_errors = len(result["fetch_errors"])
-    print(f"\n[market_data] 完成，錯誤 {total_errors} 筆")
+    # ── 摘要 log（讓 GitHub Actions log 一目了然）────────────────────────
+    print("\n[market_data] ══ 抓取完成摘要 ══")
+    print(f"[market_data] institutional rows = {len(result['institutional'])}")
+    print(f"[market_data] taiex rows         = {len(result['taiex'])}")
+    print(f"[market_data] margin rows        = {len(result['margin'])}")
+    print(f"[market_data] futures rows       = {len(result['futures'])}")
+    print(f"[market_data] tdcc rows          = {len(result['tdcc'])}")
+    errs = result["fetch_errors"]
+    print(f"[market_data] fetch_errors       = {len(errs)} 筆")
+    for e in errs:
+        print(f"  ⚠️  {e}")
+
     return result
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
