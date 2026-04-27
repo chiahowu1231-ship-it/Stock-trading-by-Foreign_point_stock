@@ -606,120 +606,205 @@ def fetch_margin_history(days: int = 6) -> list:
 
 def fetch_futures_institutional(date_str: str) -> Optional[dict]:
     """
-    抓取期交所三大法人期貨（台指期）淨部位。
+    抓取期交所三大法人台指期淨未平倉口數。
 
-    ── 根本 Bug 修正 ──────────────────────────────────────────────────────
-    TAIFEX futContractsDate 表格中，自營商有兩個子行：
-      「自行買賣」和「避險」，且 TAIFEX 用 rowspan 合併「自營商」字樣。
+    Layer 1 (主): TAIFEX OpenData JSON API — 欄位固定、不受 HTML 結構影響
+      GET https://opendata.taifex.com.tw/v1/DailyFutures3LegalPerson?date=YYYY/MM/DD
+      回傳 JSON array，找 contractCode == "TX"（台指期）的記錄
+      外資：Identity == "外資及陸資(不含外資自營商)" 或 "外資自營商"
+      投信：Identity == "投信"
+      自營商：Identity == "自營商(自行買賣)" + "自營商(避險)"（兩行累加）
 
-    舊版問題（導致 dealer_net_oi = 0 的根本原因）：
-      1. 只看 tds[0] 判斷身份 → 「避險」行因 rowspan 導致 tds[0] 是數字，
-         "自營商" in name 永遠 False，該行被完全跳過
-      2. 固定用 vals[11] 取淨口數 → TAIFEX 若新增欄位，index 就錯位
-
-    修正策略：
-      1. 掃描所有 td 找身份關鍵字（不只看 tds[0]）
-      2. 動態從 <th> 欄位標頭反推「多空淨額-未平倉口數」的實際 index
-      3. 跨 rowspan 追蹤上一行的身份（last_identity）讓「避險」行繼承
-    ──────────────────────────────────────────────────────────────────────
+    Layer 2 (備): TAIFEX futContractsDate HTML（重新設計欄位偵測邏輯）
+      改用「欄位標頭 th 位置」反推淨口數欄 index，不再固定寫死。
     """
-    url = "https://www.taifex.com.tw/cht/3/futContractsDate"
+    date_fmt = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:8]}"
 
+    result = {
+        "date": date_str,
+        "foreign_net_oi": 0,
+        "trust_net_oi":   0,
+        "dealer_net_oi":  0,
+    }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Layer 1: TAIFEX OpenData JSON API
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    try:
+        api_url = "https://opendata.taifex.com.tw/v1/DailyFutures3LegalPerson"
+        r = SESSION.get(api_url, params={"date": date_fmt}, timeout=15)
+        if r.status_code == 200:
+            try:
+                items = r.json()
+            except (ValueError, Exception):
+                items = []
+
+            # 找台指期（contractCode 可能是 "TX" 或 "臺股期貨"）
+            tx_rows = [
+                x for x in items
+                if isinstance(x, dict) and (
+                    x.get("contractCode", "").strip() in ("TX", "臺股期貨", "TXF")
+                    or "臺股" in x.get("contractName", "")
+                    or x.get("commodityId", "").strip() == "TX"
+                )
+            ]
+
+            if tx_rows:
+                dealer_acc = 0
+                has_f = has_t = has_d = False
+
+                for row in tx_rows:
+                    # OpenData 欄位：以下幾個可能的 key 名稱
+                    identity = (
+                        row.get("identity", "")
+                        or row.get("Identity", "")
+                        or row.get("identityCode", "")
+                        or ""
+                    ).strip()
+
+                    # 多空淨額-未平倉口數（各版本欄位名稱可能不同）
+                    net_oi = _safe_int(
+                        row.get("netOI")
+                        or row.get("NetOI")
+                        or row.get("multipleAndSingleOpenInterestNetVolume")
+                        or row.get("multipleAndSingleOpenInterestNetAmount")  # fallback
+                        or 0
+                    )
+
+                    # 異常大的數值代表抓到金額欄（千元），捨棄
+                    if abs(net_oi) > 500_000:
+                        net_oi = 0
+
+                    if "外資及陸資" in identity and "自營" not in identity:
+                        result["foreign_net_oi"] += net_oi
+                        has_f = True
+                    elif "外資自營" in identity:
+                        pass  # 外資自營商不計入外資現貨統計
+                    elif "投信" in identity:
+                        result["trust_net_oi"] = net_oi
+                        has_t = True
+                    elif "自營商" in identity:
+                        dealer_acc += net_oi
+                        has_d = True
+
+                result["dealer_net_oi"] = dealer_acc
+
+                if has_f or has_t or has_d:
+                    print(f"  [futures-L1] {date_str} 外資={result['foreign_net_oi']:,} "
+                          f"投信={result['trust_net_oi']:,} 自營={result['dealer_net_oi']:,}")
+                    return result
+
+                print(f"  [futures-L1] {date_str}: 找到 {len(tx_rows)} 筆但無法分類，keys={list(tx_rows[0].keys()) if tx_rows else []}")
+            else:
+                print(f"  [futures-L1] {date_str}: 無台指期資料，total items={len(items)}")
+    except Exception as e:
+        print(f"  [futures-L1] {date_str}: OpenData 失敗: {e}")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Layer 2: TAIFEX futContractsDate HTML（動態 th 定位版）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print(f"  [futures-L2] {date_str}: 嘗試 HTML 備援...")
     try:
         from bs4 import BeautifulSoup
 
         form_data = {
-            "queryType": "1",
-            "goession": "",
-            "doession": "",
+            "queryType":   "1",
+            "goession":    "",
+            "doession":    "",
             "commodity_id": "TX",
-            "queryDate": f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:8]}",
+            "queryDate":   date_fmt,
         }
-
-        r = requests.post(url, data=form_data, headers=HEADERS, timeout=15)
+        r = SESSION.post(
+            "https://www.taifex.com.tw/cht/3/futContractsDate",
+            data=form_data, timeout=15
+        )
         r.encoding = "utf-8"
-
         if r.status_code != 200:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-
-        result = {
-            "date": date_str,
-            "foreign_net_oi": 0,
-            "trust_net_oi": 0,
-            "dealer_net_oi": 0,
-        }
+        result["foreign_net_oi"] = 0
+        result["trust_net_oi"]   = 0
+        result["dealer_net_oi"]  = 0
 
         dealer_acc  = 0
         has_foreign = has_trust = has_dealer = False
 
         for table in soup.find_all("table"):
-            last_identity = ""   # 跨 rowspan 追蹤身份
+            # ── 從 <th> 反推「多空淨額-未平倉口數」欄位 index ──
+            oi_col = None
+            for hrow in table.find_all("tr"):
+                ths = hrow.find_all("th")
+                if not ths:
+                    continue
+                for idx, th in enumerate(ths):
+                    txt = th.get_text(strip=True)
+                    if "未平倉" in txt and "口數" in txt and "淨" in txt:
+                        oi_col = idx
+                        break
+                if oi_col is not None:
+                    break
 
+            last_identity = ""
             for tr in table.find_all("tr"):
                 tds = tr.find_all("td")
-                if len(tds) < 6:    # 至少要有資料欄
+                if len(tds) < 6:
                     continue
-
                 vals = [td.get_text(strip=True) for td in tds]
 
-                # ── 偵測身份關鍵字（掃全部 td，解決 rowspan 問題）──────────
-                raw_identity = ""
-                has_id_col = False
-                for td in tds:
-                    txt = td.get_text(strip=True)
-                    if any(k in txt for k in ["自營商", "投信", "外資及陸資", "外資自營"]):
-                        raw_identity = txt
-                        has_id_col = True
+                # 動態偵測身份欄
+                identity = ""
+                id_idx   = -1
+                for i, v in enumerate(vals[:4]):
+                    if any(k in v for k in ("自營商", "投信", "外資及陸資", "外資自營")):
+                        identity = v
+                        id_idx   = i
                         break
 
-                # ── 固定 Index 判斷（最簡單直白，不做減法偏移）────────────
-                # 有身份欄（外資/投信/自營商-自行買賣）：列長度=13，淨口數固定 index 11
-                # 無身份欄（自營商-避險子行，rowspan 吃掉第1欄）：列長度=12，index 前移 → 10
-                if has_id_col:
-                    last_identity = raw_identity
-                    adjusted_idx = 11
+                if identity:
+                    last_identity = identity
                 else:
-                    adjusted_idx = 10
+                    identity = last_identity  # 繼承 rowspan 身份
 
-                # 邊界防呆
-                if adjusted_idx >= len(vals):
-                    adjusted_idx = len(vals) - 2
+                if not identity:
+                    continue
 
-                net_oi = _safe_int(vals[adjusted_idx]) if adjusted_idx < len(vals) else 0
+                # 取淨口數：優先用 th 反推的 oi_col，否則倒數第 2 欄
+                if oi_col is not None and id_idx >= 0:
+                    # data cols 從 id_idx+1 開始，th index 從 0 對應
+                    data_idx = (oi_col - id_idx) if oi_col > id_idx else len(vals) - 2
+                else:
+                    data_idx = len(vals) - 2
 
-                # 合理性驗證：契約金額（千元）動輒百萬，若誤抓到則歸零
-                if abs(net_oi) > 1_000_000:
+                data_idx = max(0, min(data_idx, len(vals) - 1))
+                net_oi   = _safe_int(vals[data_idx])
+
+                if abs(net_oi) > 500_000:
                     net_oi = 0
 
-                identity = last_identity
-
-                # ── 分類累加 ─────────────────────────────────────────────
-                if "外資及陸資" in identity and "外資自營" not in identity:
-                    if not has_foreign:
-                        result["foreign_net_oi"] = net_oi
-                        has_foreign = True
+                if "外資及陸資" in identity and "自營" not in identity:
+                    result["foreign_net_oi"] += net_oi
+                    has_foreign = True
                 elif "投信" in identity:
-                    if not has_trust:
-                        result["trust_net_oi"] = net_oi
-                        has_trust = True
+                    result["trust_net_oi"] = net_oi
+                    has_trust = True
                 elif "自營商" in identity:
-                    # 累加：自行買賣 + 避險（兩行都計入）
                     dealer_acc += net_oi
                     has_dealer = True
 
-        result["dealer_net_oi"] = dealer_acc
+            if has_foreign and has_trust and has_dealer:
+                break
 
+        result["dealer_net_oi"] = dealer_acc
         if has_foreign or has_trust or has_dealer:
-            print(f"  [futures] {date_str} 外資={result['foreign_net_oi']:,} "
+            print(f"  [futures-L2] {date_str} 外資={result['foreign_net_oi']:,} "
                   f"投信={result['trust_net_oi']:,} 自營={result['dealer_net_oi']:,}")
             return result
 
     except ImportError:
-        print("  [futures] BeautifulSoup not available")
+        print("  [futures-L2] BeautifulSoup not available")
     except Exception as e:
-        print(f"  [futures] 解析失敗: {e}")
+        print(f"  [futures-L2] 解析失敗: {e}")
 
     return None
 

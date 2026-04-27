@@ -1806,27 +1806,9 @@ def build_analysis_pdf(summary: dict, pdf_path: str):
                 bg, acc, default_lbl = SEC_CFG.get(letter, (C["blue"], C["blue2"], f"{letter}）"))
                 lbl = f"{letter}）{ai_title}" if ai_title else default_lbl
 
-                # E) 摘要：特大字體
+                # E) 一句話摘要已移除，直接跳過
                 if letter == "E":
-                    summary_txt = ai_title
-                    sec_tbl = Table([[
-                        p(lbl, fontName=FNB, fontSize=11, leading=16, textColor=C["white"]),
-                    ]], colWidths=[CW])
-                    sec_tbl.setStyle(TableStyle([
-                        ("BACKGROUND",   (0,0),(-1,-1), bg),
-                        ("LEFTPADDING",  (0,0),(-1,-1), 14),
-                        ("TOPPADDING",   (0,0),(-1,-1), 8),
-                        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
-                        ("LINEAFTER",    (0,0),(0,-1),  4, acc),
-                    ]))
-                    story += [Spacer(1,3.5*mm), sec_tbl]
-                    if summary_txt:
-                        story.append(p(
-                            re.sub(r'\*\*(.+?)\*\*', r'\1', summary_txt),
-                            fontName=FNB, fontSize=10.5, leading=16,
-                            textColor=C["purple2"],
-                            spaceBefore=4, spaceAfter=4, leftIndent=8,
-                        ))
+                    cur_letter = "E"
                     in_sec = True
                     continue
 
@@ -1844,12 +1826,8 @@ def build_analysis_pdf(summary: dict, pdf_path: str):
                 in_sec = True
                 continue
 
-            # E) 下面的行（摘要文字）
+            # E) 一句話摘要已移除，跳過
             if cur_letter == "E":
-                txt = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
-                story.append(p(txt, fontName=FNB, fontSize=10, leading=15,
-                               textColor=C["purple2"],
-                               spaceBefore=2, spaceAfter=2, leftIndent=8))
                 continue
 
             # 前言（無區段）
