@@ -22,14 +22,29 @@ TZ = ZoneInfo("Asia/Taipei")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+# 強化 HEADERS：加上 Referer、Sec-Fetch-* 偽裝瀏覽器 AJAX 請求
+# TWSE 對 GitHub Actions IP 段的反爬蟲規則會檢查這些欄位
 HEADERS = {
     "User-Agent": UA,
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Referer": "https://www.twse.com.tw/zh/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+# OpenAPI 用簡單 headers（避免被誤判為複雜爬蟲）
+OPENAPI_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
 
@@ -61,28 +76,47 @@ def _safe_float(s) -> float:
 
 
 def _get_json(url: str, params: dict = None, retries: int = 3, timeout: int = 15) -> Optional[dict]:
-    """帶重試的 JSON GET（對 TWSE 回傳格式寬容）。所有失敗都印出 url/params/status/exception。"""
+    """
+    帶重試的 JSON GET（對 TWSE 回傳格式寬容）。
+
+    強化點：
+      - 自動依 url 切換 HEADERS（openapi 用簡單的，主站用完整瀏覽器偽裝）
+      - 指數退避（1s, 2s, 4s）+ jitter
+      - 403/429 特別處理（等久一點避免限流）
+      - JSON 解析失敗時印出 response 前 200 字元方便除錯
+    """
+    headers = OPENAPI_HEADERS if "openapi.twse.com.tw" in url else HEADERS
+
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except ValueError as je:
+                    print(f"  [_get_json] JSON 解析失敗 | url={url} | params={params} | {je}")
+                    print(f"             response 前 200 字: {r.text[:200]!r}")
+                    return None
                 if isinstance(data, list):
                     return {"data": data}
                 if isinstance(data, dict):
                     return data
-            # 非 200：印出完整診斷資訊
             print(f"  [_get_json] HTTP {r.status_code} | url={url} | params={params}")
+            if r.status_code in (403, 429):
+                # 被擋／被限流，等久一點再試
+                time.sleep(3.0 + attempt * 2)
+                continue
         except Exception as e:
             print(f"  [_get_json] attempt {attempt+1}/{retries} failed"
                   f" | url={url} | params={params} | {type(e).__name__}: {e}")
-        time.sleep(1.0 + random.uniform(0, 0.5))
+        # 指數退避
+        time.sleep((2 ** attempt) + random.uniform(0, 0.5))
     print(f"  [_get_json] 全部 {retries} 次重試失敗 | url={url} | params={params}")
     return None
 
 
 def _get_html(url: str, params: dict = None, retries: int = 3, timeout: int = 15) -> Optional[str]:
-    """帶重試的 HTML GET。所有失敗都印出 url/params/exception。"""
+    """帶重試的 HTML GET。指數退避 + 403/429 處理 + 完整 debug log。"""
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
@@ -90,10 +124,13 @@ def _get_html(url: str, params: dict = None, retries: int = 3, timeout: int = 15
             if r.status_code == 200 and r.text:
                 return r.text
             print(f"  [_get_html] HTTP {r.status_code} | url={url} | params={params}")
+            if r.status_code in (403, 429):
+                time.sleep(3.0 + attempt * 2)
+                continue
         except Exception as e:
             print(f"  [_get_html] attempt {attempt+1}/{retries} failed"
                   f" | url={url} | params={params} | {type(e).__name__}: {e}")
-        time.sleep(1.0 + random.uniform(0, 0.5))
+        time.sleep((2 ** attempt) + random.uniform(0, 0.5))
     print(f"  [_get_html] 全部 {retries} 次重試失敗 | url={url} | params={params}")
     return None
 
@@ -195,15 +232,39 @@ def fetch_institutional_history(days: int = 6) -> list:
     """
     抓取近 N 個交易日的三大法人買賣超（逐日真實數據）。
 
-    修正歷程：
-      舊版用 date= 參數，TWSE 只回最新一天 → 6次查詢拿到6份相同數據
-      新版用 dayDate=YYYYMMDD + 日期驗證 + 去重 + openapi 備援
+    路徑優先順序（基於 GitHub Actions IP 環境的可靠性）：
+      Track A: openapi.twse.com.tw（開放資料 API，CDN 不限 IP，最穩定）
+      Track B: rwd/zh/fund/BFI82U（dayDate 精確查詢，補歷史日）
+      Track C: exchangeReport/BFI82U（最後備援）
     """
-    results_map: dict = {}   # date_str → entry（去重 key）
+    results_map: dict = {}
     today = datetime.now(TZ)
-    url   = "https://www.twse.com.tw/exchangeReport/BFI82U"
 
-    # ── Track A：dayDate 精確逐日查詢 ─────────────────────────────────────
+    # ── Track A：openapi 開放資料 API（最優先，不限 IP）──────────────────
+    try:
+        resp = _get_json("https://openapi.twse.com.tw/v1/fund/BFI82U")
+        rows = resp if isinstance(resp, list) else (resp or {}).get("data", [])
+        if rows:
+            today_str = today.strftime("%Y%m%d")
+            converted = [
+                [r.get("SecuritiesTraderName", ""),
+                 r.get("Buy", "0"), r.get("Sell", "0"), r.get("Net", "0")]
+                for r in rows if isinstance(r, dict)
+            ]
+            entry = _parse_bfi82u_rows(converted, today_str)
+            if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
+                results_map[today_str] = entry
+                print(f"  [inst-openapi] ✓ {today_str} "
+                      f"外資={entry['foreign']['net']:,} "
+                      f"投信={entry['trust']['net']:,} "
+                      f"自營={entry['dealer']['net']:,}")
+        else:
+            print("  [inst-openapi] 回傳空陣列，改試 rwd")
+    except Exception as e:
+        print(f"  [inst-openapi] 例外: {e}")
+
+    # ── Track B：rwd 新路徑 dayDate 精確逐日查詢（補歷史日）──────────────
+    url_rwd = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
     for delta in range(days * 2 + 5):
         if len(results_map) >= days:
             break
@@ -214,9 +275,9 @@ def fetch_institutional_history(days: int = 6) -> list:
         if date_str in results_map:
             continue
         try:
-            data = _get_json(url, params={"response": "json", "dayDate": date_str, "type": "day"})
+            data = _get_json(url_rwd, params={"response": "json", "dayDate": date_str, "type": "day"})
             if not data or not data.get("data"):
-                print(f"  [inst-dayDate] {date_str} 無資料（假日/尚未更新）")
+                print(f"  [inst-rwd] {date_str} 無資料（假日/尚未更新/被擋）")
                 time.sleep(0.5)
                 continue
 
@@ -224,50 +285,48 @@ def fetch_institutional_history(days: int = 6) -> list:
             if len(actual) == 7:
                 actual = f"{int(actual[:3]) + 1911}{actual[3:]}"
             if actual and len(actual) == 8 and actual != date_str:
-                print(f"  [inst-dayDate] 查 {date_str}，回傳 {actual}，跳過")
+                print(f"  [inst-rwd] 查 {date_str}，回傳 {actual}，跳過")
                 time.sleep(0.5)
                 continue
 
             entry = _parse_bfi82u_rows(data["data"], date_str)
             if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
                 results_map[date_str] = entry
-                print(f"  [inst-dayDate] ✓ {date_str} "
+                print(f"  [inst-rwd] ✓ {date_str} "
                       f"外資={entry['foreign']['net']:,} "
                       f"投信={entry['trust']['net']:,} "
                       f"自營={entry['dealer']['net']:,}")
             else:
-                print(f"  [inst-dayDate] {date_str} 解析結果全零，跳過")
+                print(f"  [inst-rwd] {date_str} 解析結果全零，跳過")
         except Exception as e:
-            print(f"  [inst-dayDate] {date_str} 例外: {e}")
-        time.sleep(0.8 + random.uniform(0, 0.3))
+            print(f"  [inst-rwd] {date_str} 例外: {e}")
+        time.sleep(1.0 + random.uniform(0, 0.5))
 
-    # ── Track B：openapi 今日即時補漏（19:40 更新前的時間窗口）─────────────
-    today_str = today.strftime("%Y%m%d")
-    if today_str not in results_map:
-        try:
-            resp = _get_json("https://openapi.twse.com.tw/v1/fund/BFI82U")
-            rows = resp if isinstance(resp, list) else (resp or {}).get("data", [])
-            if rows:
-                # openapi 格式轉換成統一格式
-                converted = [
-                    [r.get("SecuritiesTraderName", ""),
-                     r.get("Buy", "0"), r.get("Sell", "0"), r.get("Net", "0")]
-                    for r in rows if isinstance(r, dict)
-                ]
-                entry = _parse_bfi82u_rows(converted, today_str)
-                if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
-                    results_map[today_str] = entry
-                    print(f"  [inst-openapi] ✓ {today_str} "
-                          f"外資={entry['foreign']['net']:,} "
-                          f"投信={entry['trust']['net']:,} "
-                          f"自營={entry['dealer']['net']:,}")
-                else:
-                    print(f"  [inst-openapi] {today_str} 回傳全零")
-        except Exception as e:
-            print(f"  [inst-openapi] 例外: {e}")
+    # ── Track C：exchangeReport 老路徑備援（rwd 也失效時）─────────────────
+    if len(results_map) < days:
+        url_old = "https://www.twse.com.tw/exchangeReport/BFI82U"
+        for delta in range(days * 2 + 5):
+            if len(results_map) >= days:
+                break
+            d = today - timedelta(days=delta)
+            if d.weekday() >= 5:
+                continue
+            date_str = d.strftime("%Y%m%d")
+            if date_str in results_map:
+                continue
+            try:
+                data = _get_json(url_old, params={"response": "json", "dayDate": date_str, "type": "day"})
+                if data and data.get("data"):
+                    entry = _parse_bfi82u_rows(data["data"], date_str)
+                    if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
+                        results_map[date_str] = entry
+                        print(f"  [inst-old] ✓ {date_str} (exchangeReport 備援)")
+            except Exception as e:
+                print(f"  [inst-old] {date_str} 例外: {e}")
+            time.sleep(1.0 + random.uniform(0, 0.5))
 
     if not results_map:
-        print("  [inst] ⚠️ 全部查詢失敗，institutional 為空")
+        print("  [inst] ⚠️ 全部 3 條路徑均失敗，institutional 為空")
 
     return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
 
@@ -546,33 +605,33 @@ def _margin_from_html(date_str: str) -> Optional[dict]:
 
 def fetch_margin_trading(date_str: str) -> Optional[dict]:
     """
-    融資融券抓取 — 三層 fallback：
-      Layer 1: exchangeReport/MI_MARGN JSON（多 selectType）
-      Layer 2: openapi.twse.com.tw OpenData API
-      Layer 3: rwd/MI_MARGN JSON（新版路由）
+    融資融券抓取 — 三層 fallback（依 GitHub Actions 環境穩定性排序）：
+      Layer 1: openapi.twse.com.tw OpenData API（最穩定，不限 IP）
+      Layer 2: rwd/zh/marginTrading/MI_MARGN JSON（dayDate 精確查詢）
+      Layer 3: 老路徑 HTML 解析（最後備援）
     """
-    # Layer 1
-    result = _margin_from_json(date_str)
-    if result:
-        print(f"  [margin] {date_str} ✓ Layer1 mb={result['margin_balance']:,} sb={result['short_balance']:,}")
-        return result
-
-    print(f"  [margin] {date_str} Layer1 失敗，嘗試 Layer2 (OpenAPI)...")
-    time.sleep(0.5)
-
-    # Layer 2
+    # Layer 1: OpenAPI（最優先，因不限 IP）
     result = _margin_from_openapi(date_str)
     if result:
-        print(f"  [margin] {date_str} ✓ Layer2 mb={result['margin_balance']:,} sb={result['short_balance']:,}")
+        print(f"  [margin] {date_str} ✓ OpenAPI mb={result['margin_balance']:,} sb={result['short_balance']:,}")
         return result
 
-    print(f"  [margin] {date_str} Layer2 失敗，嘗試 Layer3 (rwd)...")
+    print(f"  [margin] {date_str} OpenAPI 無資料，嘗試 rwd JSON...")
     time.sleep(0.5)
 
-    # Layer 3
+    # Layer 2: rwd JSON
+    result = _margin_from_json(date_str)
+    if result:
+        print(f"  [margin] {date_str} ✓ rwd JSON mb={result['margin_balance']:,} sb={result['short_balance']:,}")
+        return result
+
+    print(f"  [margin] {date_str} rwd JSON 失敗，嘗試 HTML...")
+    time.sleep(0.5)
+
+    # Layer 3: HTML
     result = _margin_from_html(date_str)
     if result:
-        print(f"  [margin] {date_str} ✓ Layer3 mb={result['margin_balance']:,} sb={result['short_balance']:,}")
+        print(f"  [margin] {date_str} ✓ HTML mb={result['margin_balance']:,} sb={result['short_balance']:,}")
         return result
 
     print(f"  [margin] {date_str} ✗ 三層均失敗")
