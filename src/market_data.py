@@ -228,42 +228,124 @@ def fetch_institutional_trading(date_str: str) -> Optional[dict]:
     return _parse_bfi82u_rows(data["data"], date_str)
 
 
+def _fetch_finmind(dataset: str, start_date: str, end_date: str = "") -> list:
+    """
+    FinMind 開放 API：第三方台股財經資料（不限 IP，最可靠）
+    https://finmindtrade.com/
+    免費版每小時限 600 次請求，足夠每日報表使用。
+    """
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset":    dataset,
+        "start_date": start_date,
+    }
+    if end_date:
+        params["end_date"] = end_date
+
+    try:
+        r = requests.get(url, params=params, headers=OPENAPI_HEADERS, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == 200 or "data" in data:
+                return data.get("data", []) or []
+            print(f"  [finmind] {dataset} 回傳 status={data.get('status')} msg={data.get('msg','')}")
+        else:
+            print(f"  [finmind] HTTP {r.status_code} dataset={dataset}")
+    except Exception as e:
+        print(f"  [finmind] {dataset} 例外: {type(e).__name__}: {e}")
+    return []
+
+
 def fetch_institutional_history(days: int = 6) -> list:
     """
     抓取近 N 個交易日的三大法人買賣超（逐日真實數據）。
 
-    路徑優先順序（基於 GitHub Actions IP 環境的可靠性）：
-      Track A: openapi.twse.com.tw（開放資料 API，CDN 不限 IP，最穩定）
-      Track B: rwd/zh/fund/BFI82U（dayDate 精確查詢，補歷史日）
+    路徑優先順序（依 GitHub Actions IP 環境的可靠性排序）：
+      Track 0: FinMind 第三方 API（最可靠，CDN 不限 IP）
+      Track A: openapi.twse.com.tw（TWSE 開放資料 CDN）
+      Track B: rwd/zh/fund/BFI82U（dayDate 精確查詢）
       Track C: exchangeReport/BFI82U（最後備援）
     """
     results_map: dict = {}
     today = datetime.now(TZ)
 
-    # ── Track A：openapi 開放資料 API（最優先，不限 IP）──────────────────
+    # ── Track 0：FinMind 第三方 API（最可靠）─────────────────────────────
+    # dataset: TaiwanStockInstitutionalInvestorsBuySell
+    # 回傳結構：[{date, name(="Foreign_Investor"/"Investment_Trust"/"Dealer_self"/"Dealer_Hedging"),
+    #            buy, sell, ...}]
+    try:
+        start_dt = (today - timedelta(days=days * 2 + 7)).strftime("%Y-%m-%d")
+        end_dt   = today.strftime("%Y-%m-%d")
+        rows = _fetch_finmind(
+            "TaiwanStockInstitutionalInvestorsBuySell",
+            start_dt, end_dt
+        )
+        if rows:
+            # 依日期分組
+            by_date: dict = {}
+            for r in rows:
+                d = str(r.get("date", "")).replace("-", "")  # YYYY-MM-DD → YYYYMMDD
+                if not d:
+                    continue
+                by_date.setdefault(d, []).append(r)
+
+            for d, items in by_date.items():
+                foreign_net = trust_net = dealer_net = 0
+                for it in items:
+                    name = str(it.get("name", "")).lower()
+                    buy  = _safe_int(it.get("buy", 0))
+                    sell = _safe_int(it.get("sell", 0))
+                    net  = buy - sell
+                    if "foreign" in name:
+                        foreign_net += net
+                    elif "investment_trust" in name or "trust" in name:
+                        trust_net += net
+                    elif "dealer" in name:
+                        dealer_net += net
+                if foreign_net or trust_net or dealer_net:
+                    results_map[d] = {
+                        "date": d,
+                        "foreign": {"buy": 0, "sell": 0, "net": foreign_net},
+                        "trust":   {"buy": 0, "sell": 0, "net": trust_net},
+                        "dealer":  {"buy": 0, "sell": 0, "net": dealer_net},
+                        "total_net": foreign_net + trust_net + dealer_net,
+                    }
+            if results_map:
+                print(f"  [inst-finmind] ✓ 取得 {len(results_map)} 個交易日")
+                for d in sorted(results_map.keys(), reverse=True)[:days]:
+                    e = results_map[d]
+                    print(f"     {d}: 外資={e['foreign']['net']:,} "
+                          f"投信={e['trust']['net']:,} 自營={e['dealer']['net']:,}")
+    except Exception as e:
+        print(f"  [inst-finmind] 例外: {e}")
+
+    # 若 FinMind 已拿到足夠資料，直接返回
+    if len(results_map) >= days:
+        return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
+
+    # ── Track A：openapi 開放資料 API ─────────────────────────────────────
     try:
         resp = _get_json("https://openapi.twse.com.tw/v1/fund/BFI82U")
         rows = resp if isinstance(resp, list) else (resp or {}).get("data", [])
         if rows:
             today_str = today.strftime("%Y%m%d")
-            converted = [
-                [r.get("SecuritiesTraderName", ""),
-                 r.get("Buy", "0"), r.get("Sell", "0"), r.get("Net", "0")]
-                for r in rows if isinstance(r, dict)
-            ]
-            entry = _parse_bfi82u_rows(converted, today_str)
-            if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
-                results_map[today_str] = entry
-                print(f"  [inst-openapi] ✓ {today_str} "
-                      f"外資={entry['foreign']['net']:,} "
-                      f"投信={entry['trust']['net']:,} "
-                      f"自營={entry['dealer']['net']:,}")
-        else:
-            print("  [inst-openapi] 回傳空陣列，改試 rwd")
+            if today_str not in results_map:
+                converted = [
+                    [r.get("SecuritiesTraderName", ""),
+                     r.get("Buy", "0"), r.get("Sell", "0"), r.get("Net", "0")]
+                    for r in rows if isinstance(r, dict)
+                ]
+                entry = _parse_bfi82u_rows(converted, today_str)
+                if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
+                    results_map[today_str] = entry
+                    print(f"  [inst-openapi] ✓ {today_str} "
+                          f"外資={entry['foreign']['net']:,} "
+                          f"投信={entry['trust']['net']:,} "
+                          f"自營={entry['dealer']['net']:,}")
     except Exception as e:
         print(f"  [inst-openapi] 例外: {e}")
 
-    # ── Track B：rwd 新路徑 dayDate 精確逐日查詢（補歷史日）──────────────
+    # ── Track B：rwd 新路徑 dayDate ────────────────────────────────────────
     url_rwd = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
     for delta in range(days * 2 + 5):
         if len(results_map) >= days:
@@ -277,56 +359,24 @@ def fetch_institutional_history(days: int = 6) -> list:
         try:
             data = _get_json(url_rwd, params={"response": "json", "dayDate": date_str, "type": "day"})
             if not data or not data.get("data"):
-                print(f"  [inst-rwd] {date_str} 無資料（假日/尚未更新/被擋）")
                 time.sleep(0.5)
                 continue
-
             actual = str(data.get("date", "")).replace("/", "")
             if len(actual) == 7:
                 actual = f"{int(actual[:3]) + 1911}{actual[3:]}"
             if actual and len(actual) == 8 and actual != date_str:
-                print(f"  [inst-rwd] 查 {date_str}，回傳 {actual}，跳過")
                 time.sleep(0.5)
                 continue
-
             entry = _parse_bfi82u_rows(data["data"], date_str)
             if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
                 results_map[date_str] = entry
-                print(f"  [inst-rwd] ✓ {date_str} "
-                      f"外資={entry['foreign']['net']:,} "
-                      f"投信={entry['trust']['net']:,} "
-                      f"自營={entry['dealer']['net']:,}")
-            else:
-                print(f"  [inst-rwd] {date_str} 解析結果全零，跳過")
+                print(f"  [inst-rwd] ✓ {date_str}")
         except Exception as e:
             print(f"  [inst-rwd] {date_str} 例外: {e}")
         time.sleep(1.0 + random.uniform(0, 0.5))
 
-    # ── Track C：exchangeReport 老路徑備援（rwd 也失效時）─────────────────
-    if len(results_map) < days:
-        url_old = "https://www.twse.com.tw/exchangeReport/BFI82U"
-        for delta in range(days * 2 + 5):
-            if len(results_map) >= days:
-                break
-            d = today - timedelta(days=delta)
-            if d.weekday() >= 5:
-                continue
-            date_str = d.strftime("%Y%m%d")
-            if date_str in results_map:
-                continue
-            try:
-                data = _get_json(url_old, params={"response": "json", "dayDate": date_str, "type": "day"})
-                if data and data.get("data"):
-                    entry = _parse_bfi82u_rows(data["data"], date_str)
-                    if entry and any(entry[k]["net"] != 0 for k in ("foreign", "trust", "dealer")):
-                        results_map[date_str] = entry
-                        print(f"  [inst-old] ✓ {date_str} (exchangeReport 備援)")
-            except Exception as e:
-                print(f"  [inst-old] {date_str} 例外: {e}")
-            time.sleep(1.0 + random.uniform(0, 0.5))
-
     if not results_map:
-        print("  [inst] ⚠️ 全部 3 條路徑均失敗，institutional 為空")
+        print("  [inst] ⚠️ 全部路徑均失敗，institutional 為空")
 
     return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
 
@@ -639,24 +689,57 @@ def fetch_margin_trading(date_str: str) -> Optional[dict]:
 
 
 def fetch_margin_history(days: int = 6) -> list:
-    """抓取近 N 天的融資融券（三層 fallback）"""
-    results = []
+    """
+    抓取近 N 天的融資融券。
+    優先順序：FinMind 第三方 API → TWSE 三層 fallback。
+    """
+    results_map: dict = {}
     today = datetime.now(TZ)
 
+    # ── Track 0：FinMind 第三方 API ──────────────────────────────────────
+    try:
+        start_dt = (today - timedelta(days=days * 2 + 7)).strftime("%Y-%m-%d")
+        end_dt   = today.strftime("%Y-%m-%d")
+        rows = _fetch_finmind("TaiwanStockTotalMarginPurchaseShortSale", start_dt, end_dt)
+        for r in rows:
+            d = str(r.get("date", "")).replace("-", "")
+            if not d:
+                continue
+            results_map[d] = {
+                "date":            d,
+                "margin_balance":  _safe_int(r.get("MarginPurchaseTodayBalance", 0)),
+                "margin_buy":      _safe_int(r.get("MarginPurchaseBuy", 0)),
+                "margin_sell":     _safe_int(r.get("MarginPurchaseSell", 0)),
+                "short_balance":   _safe_int(r.get("ShortSaleTodayBalance", 0)),
+                "short_sell":      _safe_int(r.get("ShortSaleSell", 0)),
+                "short_cover":     _safe_int(r.get("ShortSaleBuy", 0)),
+            }
+        if results_map:
+            print(f"  [margin-finmind] ✓ 取得 {len(results_map)} 個交易日")
+    except Exception as e:
+        print(f"  [margin-finmind] 例外: {e}")
+
+    # 若 FinMind 拿到足夠資料，直接返回
+    if len(results_map) >= days:
+        return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
+
+    # ── Fallback：原本的 TWSE 三層 ─────────────────────────────────────────
     for delta in range(days * 2 + 5):
-        if len(results) >= days:
+        if len(results_map) >= days:
             break
         d = today - timedelta(days=delta)
         if d.weekday() >= 5:
             continue
         date_str = d.strftime("%Y%m%d")
+        if date_str in results_map:
+            continue
         print(f"  [margin] 抓取 {date_str}...")
         data = fetch_margin_trading(date_str)
         if data and data["margin_balance"] != 0:
-            results.append(data)
+            results_map[date_str] = data
         time.sleep(1.0 + random.uniform(0, 0.4))
 
-    return results
+    return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -869,24 +952,74 @@ def fetch_futures_institutional(date_str: str) -> Optional[dict]:
 
 
 def fetch_futures_history(days: int = 6) -> list:
-    """抓取近 N 天的期貨三大法人"""
-    results = []
+    """
+    抓取近 N 天的期貨三大法人（台指期淨未平倉口數）。
+    優先順序：FinMind 第三方 API → TAIFEX 原本兩層。
+    """
+    results_map: dict = {}
     today = datetime.now(TZ)
 
+    # ── Track 0：FinMind 第三方 API ──────────────────────────────────────
+    # dataset: TaiwanFuturesInstitutionalInvestors（含 TX 台指期）
+    try:
+        start_dt = (today - timedelta(days=days * 2 + 7)).strftime("%Y-%m-%d")
+        end_dt   = today.strftime("%Y-%m-%d")
+        rows = _fetch_finmind("TaiwanFuturesInstitutionalInvestors", start_dt, end_dt)
+        # 篩出 TX 台指期
+        rows = [r for r in rows if r.get("futures_id") == "TX"]
+        by_date: dict = {}
+        for r in rows:
+            d = str(r.get("date", "")).replace("-", "")
+            if not d:
+                continue
+            by_date.setdefault(d, []).append(r)
+
+        for d, items in by_date.items():
+            foreign_oi = trust_oi = dealer_oi = 0
+            for it in items:
+                name = str(it.get("institutional_investors", "")).lower()
+                # 淨多空未平倉口數 = long_open_interest_balance_volume - short_open_interest_balance_volume
+                long_oi  = _safe_int(it.get("long_open_interest_balance_volume", 0))
+                short_oi = _safe_int(it.get("short_open_interest_balance_volume", 0))
+                net = long_oi - short_oi
+                if "foreign" in name:
+                    foreign_oi += net
+                elif "investment_trust" in name or "trust" in name:
+                    trust_oi += net
+                elif "dealer" in name:
+                    dealer_oi += net
+            if foreign_oi or trust_oi or dealer_oi:
+                results_map[d] = {
+                    "date":           d,
+                    "foreign_net_oi": foreign_oi,
+                    "trust_net_oi":   trust_oi,
+                    "dealer_net_oi":  dealer_oi,
+                }
+        if results_map:
+            print(f"  [futures-finmind] ✓ 取得 {len(results_map)} 個交易日")
+    except Exception as e:
+        print(f"  [futures-finmind] 例外: {e}")
+
+    if len(results_map) >= days:
+        return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
+
+    # ── Fallback：原本的 TAIFEX 兩層 ──────────────────────────────────────
     for delta in range(days * 2 + 5):
-        if len(results) >= days:
+        if len(results_map) >= days:
             break
         d = today - timedelta(days=delta)
         if d.weekday() >= 5:
             continue
         date_str = d.strftime("%Y%m%d")
+        if date_str in results_map:
+            continue
         print(f"  [futures] 抓取 {date_str}...")
         data = fetch_futures_institutional(date_str)
         if data:
-            results.append(data)
+            results_map[date_str] = data
         time.sleep(1.0 + random.uniform(0, 0.5))
 
-    return results
+    return [results_map[ds] for ds in sorted(results_map.keys(), reverse=True)[:days]]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
